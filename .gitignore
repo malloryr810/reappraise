@@ -1,0 +1,16 @@
+# Environment — never commit real credentials
+.env
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# pytest
+.pytest_cache/
+.coverage
+
+# macOS
+.DS_Store
