@@ -1,13 +1,22 @@
 # Reappraise was built to automate the manual price lookup process at a Habitat for
-# Humanity ReStore, where staff price donated goods at roughly 60% of current market
-# value. This module fetches that market value from eBay and applies the discount.
+# Humanity ReStore, where staff price donated goods at roughly 60% of market value.
+# This module scrapes eBay completed/sold listings to find that market value and
+# applies the condition-based discount.
+#
+# eBay runs a JavaScript browser challenge (Akamai) that blocks plain HTTP clients
+# even with correct TLS fingerprints. Playwright executes the challenge the same way
+# a real Chrome browser does, so it gets through to the actual search results.
 
 import os
+import random
+import re
 import statistics
 import time
 from dataclasses import dataclass
+from urllib.parse import urlencode
 
-import httpx
+from bs4 import BeautifulSoup
+from playwright.sync_api import Browser, Playwright, sync_playwright
 
 
 @dataclass
@@ -50,74 +59,84 @@ CONDITION_MULTIPLIERS: dict[str, float] = {
     "like_new": 0.8,
 }
 
-_TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
-_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
-_EBAY_SCOPE = "https://api.ebay.com/oauth/api_scope"
-
-
-def _looks_real(value: str) -> bool:
-    # Placeholder strings from .env.example start with "your_" or "your-"
-    return bool(value) and not value.lower().startswith("your")
+_EBAY_SEARCH_URL = "https://www.ebay.com/sch/i.html"
+_PRICE_STRIP = re.compile(r"[$,]")
+_CACHE_TTL = 2 * 3600  # 2 hours in seconds
 
 
 class EbayClient:
     def __init__(self) -> None:
-        self.app_id = os.getenv("EBAY_APP_ID", "")
-        self.client_secret = os.getenv("EBAY_CLIENT_SECRET", "")
-        # Auto-enable mock when credentials are absent or still hold placeholder values
-        self._use_mock = (
-            os.getenv("EBAY_MOCK", "false").lower() == "true"
-            or not (_looks_real(self.app_id) and _looks_real(self.client_secret))
-        )
-        self._token: str | None = None
-        self._token_expiry: float = 0.0
+        self._use_mock = os.getenv("EBAY_MOCK", "false").lower() == "true"
+        self._last_request_at: float = 0.0
+        # In-memory price cache: normalized_query → (monotonic_ts, prices)
+        self._price_cache: dict[str, tuple[float, list[float]]] = {}
+        # Persistent browser — initialised lazily on first scrape call
+        self._playwright: Playwright | None = None
+        self._browser: Browser | None = None
+
+    # -- public ----------------------------------------------------------------
 
     def search_prices(self, query: str, condition: str = "fair", limit: int = 20) -> PriceEstimate:
         if self._use_mock:
             return self._mock_estimate(query, condition)
-        return self._live_estimate(query, condition, limit)
+        return self._scrape_estimate(query, condition, limit)
 
-    # -- live ------------------------------------------------------------------
+    def close(self) -> None:
+        """Release the persistent Playwright browser. Call when shutting down."""
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+            self._browser = None
+        if self._playwright is not None:
+            try:
+                self._playwright.stop()
+            except Exception:
+                pass
+            self._playwright = None
 
-    def _ensure_token(self) -> str:
-        # 60-second buffer: avoids a race where the token is valid at check time
-        # but has expired by the time the downstream API call completes
-        if self._token and time.monotonic() < self._token_expiry - 60:
-            return self._token
-        resp = httpx.post(
-            _TOKEN_URL,
-            auth=(self.app_id, self.client_secret),
-            data={"grant_type": "client_credentials", "scope": _EBAY_SCOPE},
-            timeout=10,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
-        self._token = payload["access_token"]
-        self._token_expiry = time.monotonic() + payload["expires_in"]
-        return self._token
+    # -- cache -----------------------------------------------------------------
 
-    def _live_estimate(self, query: str, condition: str, limit: int) -> PriceEstimate:
-        resp = httpx.get(
-            _SEARCH_URL,
-            headers={"Authorization": f"Bearer {self._ensure_token()}"},
-            params={"q": query, "limit": limit, "sort": "price"},  # ascending: cheapest first
-            timeout=10,
-        )
-        resp.raise_for_status()
-        summaries = resp.json().get("itemSummaries", [])
-        prices = [
-            float(item["price"]["value"])
-            for item in summaries
-            if "price" in item
-        ]
+    def _cache_key(self, query: str) -> str:
+        return query.strip().lower()
+
+    def _cache_get(self, query: str) -> list[float] | None:
+        entry = self._price_cache.get(self._cache_key(query))
+        if entry is None:
+            return None
+        ts, prices = entry
+        if time.monotonic() - ts > _CACHE_TTL:
+            del self._price_cache[self._cache_key(query)]
+            return None
+        return prices
+
+    def _cache_set(self, query: str, prices: list[float]) -> None:
+        self._price_cache[self._cache_key(query)] = (time.monotonic(), prices)
+
+    # -- browser ---------------------------------------------------------------
+
+    def _get_page(self):  # type: ignore[return]
+        """Return a fresh page from the persistent browser, starting it if needed."""
+        if self._playwright is None:
+            self._playwright = sync_playwright().start()
+        if self._browser is None or not self._browser.is_connected():
+            self._browser = self._playwright.chromium.launch(headless=True)
+        return self._browser.new_page()
+
+    # -- scraper ---------------------------------------------------------------
+
+    def _throttle(self) -> None:
+        """Enforce a random 1–3 s gap between consecutive live requests."""
+        elapsed = time.monotonic() - self._last_request_at
+        gap = random.uniform(1.0, 3.0)
+        if elapsed < gap:
+            time.sleep(gap - elapsed)
+        self._last_request_at = time.monotonic()
+
+    def _build_estimate(self, prices: list[float], condition: str, limit: int) -> PriceEstimate:
         multiplier = CONDITION_MULTIPLIERS.get(condition, CONDITION_MULTIPLIERS["fair"])
-        if not prices:
-            return PriceEstimate(
-                low=0.0, market_median=0.0, estimated_resale_value=0.0,
-                high=0.0, currency="USD", sample_size=0, is_mock=False,
-                condition=condition, multiplier_used=multiplier,
-            )
-        currency = summaries[0]["price"].get("currency", "USD") if summaries else "USD"
+        prices = prices[:limit]
         # Median is more resistant to outliers than mean — one $5,000 listing
         # shouldn't inflate the estimate for an item that typically sells for $50
         market_median = round(statistics.median(prices), 2)
@@ -126,12 +145,68 @@ class EbayClient:
             market_median=market_median,
             estimated_resale_value=round(market_median * multiplier, 2),
             high=round(max(prices), 2),
-            currency=currency,
+            currency="USD",
             sample_size=len(prices),
             is_mock=False,
             condition=condition,
             multiplier_used=multiplier,
         )
+
+    def _scrape_estimate(self, query: str, condition: str, limit: int) -> PriceEstimate:
+        # Cache hit — reapply the condition multiplier to the stored prices
+        cached = self._cache_get(query)
+        if cached:
+            return self._build_estimate(cached, condition, limit)
+
+        self._throttle()
+        try:
+            params = {
+                "_nkw": query,
+                "LH_Sold": "1",     # sold listings only
+                "LH_Complete": "1", # completed listings
+                "_ipg": str(limit),
+            }
+            url = f"{_EBAY_SEARCH_URL}?{urlencode(params)}"
+
+            page = self._get_page()
+            try:
+                # "load" fires after JS runs; 3 s extra lets lazy price widgets settle
+                page.goto(url, wait_until="load", timeout=30_000)
+                page.wait_for_timeout(3_000)
+                html = page.content()
+            finally:
+                page.close()
+
+            soup = BeautifulSoup(html, "html.parser")
+            prices: list[float] = []
+            for el in soup.select("span.s-card__price"):
+                # Skip crossed-out asking prices on Best-Offer-accepted listings —
+                # the actual accepted amount is not disclosed, so the number is wrong
+                if "strikethrough" in (el.get("class") or []):
+                    continue
+                text = el.get_text(strip=True)
+                # Skip price ranges like "$10.00 to $50.00"
+                if " to " in text.lower():
+                    continue
+                cleaned = _PRICE_STRIP.sub("", text).strip()
+                try:
+                    prices.append(float(cleaned))
+                except ValueError:
+                    continue
+
+            prices = prices[:limit]
+        except Exception:
+            # Any browser or network error — fall back to mock so the pipeline
+            # keeps running rather than returning a 502 to the caller
+            return self._mock_estimate(query, condition)
+
+        if not prices:
+            # Page loaded but no parseable prices (bot-check, zero results, layout
+            # change) — fall back to mock rather than returning a dead estimate
+            return self._mock_estimate(query, condition)
+
+        self._cache_set(query, prices)
+        return self._build_estimate(prices, condition, limit)
 
     # -- mock ------------------------------------------------------------------
 

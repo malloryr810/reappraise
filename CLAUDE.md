@@ -1,7 +1,7 @@
 # Item Appraisal Tool — ReStore Pricing Assistant
 
 ## What this project does
-User photographs a donated item → Google Vision identifies it → eBay lookup finds market median → applies condition multiplier to estimate fair resale price for a Habitat for Humanity ReStore.
+User photographs a donated item → Google Vision identifies it → Playwright scrapes eBay's sold/completed listings for market prices → applies a condition multiplier to estimate fair resale price for a Habitat for Humanity ReStore.
 
 ## Motivation
 Built to automate the manual price lookup process used at a Habitat for Humanity ReStore. Staff would look up donated items and price them at roughly 60% of market value. This tool does that automatically from a photo.
@@ -12,19 +12,29 @@ Condition multiplier replaces the flat rate (not stacked on top):
 - "fair" is the default and matches the ReStore's standard pricing policy
 
 ## Project structure
-- vision.py — Google Vision REST API, plain API key, LABEL_DETECTION + OBJECT_LOCALIZATION
-- ebay.py — eBay Browse API + mock fallback + condition pricing
-- app.py — FastAPI, POST /appraise, condition as optional query param
+- `vision.py` — Google Vision REST API, plain API key, LABEL_DETECTION + OBJECT_LOCALIZATION
+- `ebay.py` — Playwright-based eBay scraper (completed/sold listings), 2-hour in-memory cache, persistent browser instance, mock fallback
+- `app.py` — FastAPI, POST /appraise, condition as optional query param
+
+## eBay scraper details
+The eBay Developer API was blocked (developer account rejected twice). Instead, the scraper uses Playwright (headless Chromium) to load eBay's completed/sold listing pages directly — this bypasses the Akamai JavaScript browser challenge that blocks plain HTTP clients even with correct TLS fingerprints.
+
+Two performance optimisations are active:
+- **In-memory cache**: results keyed by normalised query string, 2-hour TTL. Cache stores raw price lists so any condition's multiplier can be applied without re-scraping.
+- **Persistent browser**: one Chromium instance shared across all requests. Initialised lazily on first scrape call, re-launched automatically if disconnected.
+
+CSS selector: `span.s-card__price` (eBay's current markup). Strikethrough prices (crossed-out asking prices on Best-Offer-accepted listings) are skipped because the actual accepted amount is not disclosed.
 
 ## Environment variables needed
-- GOOGLE_VISION_API_KEY — plain API key from GCP console
-- EBAY_CLIENT_ID and EBAY_CLIENT_SECRET — pending developer account approval
+- `GOOGLE_VISION_API_KEY` — plain API key from GCP console
+- `EBAY_MOCK=true` — optional; forces mock catalog, bypasses scraper entirely
 
 ## Current status
-- 23/23 tests passing
+- 35/35 tests passing
 - Google Vision working with real images
-- Mock eBay active, real credentials pending (1-2 days)
+- eBay scraper live — fetches real sold-listing prices via Playwright
+- In-memory cache (2-hour TTL) and persistent browser both active
 - No frontend yet
 
 ## Next task when resuming
-Swap mock eBay for real eBay Browse API once credentials are approved. Then update README.
+Build a simple frontend (file upload form, results display). Then update README with a screenshot.
