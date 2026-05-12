@@ -1,6 +1,16 @@
 # Reappraise
 
-Reappraise is a FastAPI service that estimates the resale value of a secondhand item from a photo. Upload an image, and the service identifies what's in it using Google Cloud Vision, then scrapes eBay's completed/sold listings to return a low / median / high price range drawn from real sale data. It's designed as a clean three-layer pipeline — image recognition, price lookup, and HTTP orchestration — each in its own module so the pieces are easy to swap or extend.
+A photo-to-price tool for Habitat for Humanity ReStore volunteers: photograph a donated item and get an estimated resale price drawn from real eBay listings.
+
+## Motivation
+
+I volunteered at a Habitat for Humanity ReStore where staff manually looked up donated items and priced them at roughly 60% of market value. The lookup was slow and inconsistent across volunteers. This tool automates the full workflow from a single photo.
+
+## How it works
+
+- **Google Cloud Vision** identifies the item — object localization and label detection run in one API call, deduplicated and sorted by confidence. The top labels become the eBay search query.
+- **eBay Browse API** finds the market price — fetches an OAuth bearer token (client credentials, cached until expiry), searches recent listings, and takes the median of up to 20 prices. Results are cached in memory for 2 hours so repeated queries don't make a second network call.
+- **Condition multiplier** scales the market median to a ReStore price — `fair` (0.6) is the default and matches the store's standard 60%-of-market policy.
 
 ## Architecture
 
@@ -10,97 +20,37 @@ POST /appraise (multipart image)
           ▼
   ┌───────────────┐
   │    app.py     │  FastAPI — validates input, orchestrates calls,
-  │               │            formats the JSON response
+  │               │            returns JSON response
   └──────┬────────┘
-         │
          │  1. image bytes
          ▼
   ┌───────────────┐
   │   vision.py   │  Google Cloud Vision API
-  │               │  label detection + object localization (one API call)
+  │               │  OBJECT_LOCALIZATION + LABEL_DETECTION
   └──────┬────────┘
-         │
-         │  2. ranked labels  →  joined into a search query
+         │  2. ranked labels → search query
          ▼
-  ┌───────────────────────────────────────────┐
-  │                 ebay.py                   │
-  │                                           │
-  │  In-memory cache (2-hour TTL)             │
-  │    hit → return cached prices immediately │
-  │    miss ↓                                 │
-  │                                           │
-  │  Playwright (headless Chromium)           │
-  │    loads eBay completed/sold listings     │
-  │    parses span.s-card__price elements     │
-  │    skips strikethrough / range prices     │
-  │                                           │
-  │  Mock fallback (EBAY_MOCK=true or error)  │
-  └──────┬────────────────────────────────────┘
-         │
+  ┌──────────────────────────────────────────────┐
+  │                  ebay.py                     │
+  │                                              │
+  │  In-memory cache (2-hour TTL)                │
+  │    hit → return cached prices immediately    │
+  │    miss ↓                                    │
+  │                                              │
+  │  OAuth 2.0 client credentials flow           │
+  │    POST /identity/v1/oauth2/token            │
+  │    → Bearer token (cached until expiry)      │
+  │                                              │
+  │  eBay Browse API                             │
+  │    GET /buy/browse/v1/item_summary/search    │
+  │    median of up to 20 listing prices         │
+  │                                              │
+  │  Mock fallback (EBAY_MOCK=true or API error) │
+  └──────┬───────────────────────────────────────┘
          │  3. price estimate
          ▼
-    JSON response
-  { item, labels,
-    price_estimate }
+    JSON response { item, labels, price_estimate }
 ```
-
-## Local setup
-
-**Prerequisites:** Python 3.11+, a Google Cloud API key with the Cloud Vision API enabled.
-
-```bash
-git clone <repo-url>
-cd reappraise
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-cp .env.example .env        # fill in GOOGLE_VISION_API_KEY
-uvicorn app:app --reload
-```
-
-The service starts on `http://localhost:8000`. Interactive API docs are at `http://localhost:8000/docs`.
-
-> **No eBay credentials needed.** The scraper fetches real sold-listing prices directly from eBay's website using a headless Chromium browser — no developer account or API key required. Set `EBAY_MOCK=true` to use the built-in mock catalog instead (useful for offline development or CI).
-
-## Try it
-
-```bash
-curl -X POST http://localhost:8000/appraise \
-     -F "file=@/path/to/photo.jpg"
-```
-
-With a condition override:
-
-```bash
-curl -X POST "http://localhost:8000/appraise?condition=good" \
-     -F "file=@/path/to/photo.jpg"
-```
-
-Example response:
-
-```json
-{
-  "item": "digital camera",
-  "labels": [
-    { "name": "digital camera", "confidence": 0.97 },
-    { "name": "camera",         "confidence": 0.90 },
-    { "name": "electronics",    "confidence": 0.85 }
-  ],
-  "price_estimate": {
-    "low": 16.57,
-    "market_median": 142.80,
-    "estimated_resale_value": 85.68,
-    "high": 469.00,
-    "currency": "USD",
-    "sample_size": 20,
-    "is_mock": false,
-    "condition": "fair",
-    "multiplier_used": 0.6
-  }
-}
-```
-
-`is_mock: false` confirms prices came from real eBay sold listings. `estimated_resale_value` is `market_median × multiplier_used`.
 
 ## Condition multipliers
 
@@ -112,19 +62,65 @@ Example response:
 | `good` | 0.70 | |
 | `like_new` | 0.80 | |
 
-## How it works
+## Local setup
 
-**1. Image upload**
-`POST /appraise` accepts a multipart image file and an optional `condition` query parameter. FastAPI validates content type and rejects empty files before any external calls are made.
+**Prerequisites:** Python 3.11+, a [Google Cloud API key](https://console.cloud.google.com/) with Cloud Vision enabled, and an [eBay developer account](https://developer.ebay.com/) with Browse API access.
 
-**2. Item identification — `vision.py`**
-Image bytes go to Google Cloud Vision in a single API call running two detectors: *label detection* (broad tags like "Electronics") and *object localization* (specific items like "Digital Camera"). Object localization results are ranked first — they tend to name the thing being sold rather than its surroundings. Results are lowercased, deduplicated, and sorted by confidence score. The top three labels are joined into the eBay search query.
+```bash
+git clone <repo-url>
+cd reappraise
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-**3. Price lookup — `ebay.py`**
-The query is checked against an in-memory cache (2-hour TTL, keyed by normalised query string). On a cache hit, the stored price list is returned immediately with the condition multiplier reapplied — no network call. On a miss, Playwright launches (or reuses) a persistent headless Chromium browser, loads eBay's completed/sold listings page, waits for JavaScript to render prices, and extracts `span.s-card__price` elements. Strikethrough prices (crossed-out asking prices on Best-Offer-accepted listings whose actual accepted amount is undisclosed) are skipped. Up to 20 prices are collected and cached. **Median is used instead of mean** so one outlier listing doesn't skew the estimate. On any error — network failure, browser crash, zero results — the scraper falls back to the built-in mock catalog rather than returning a 502.
+Edit `.env`:
 
-**4. Response assembly — `app.py`**
-Label list and price estimate are combined into a single JSON response. External call failures surface as 502 errors with descriptive messages. Missing data (no labels detected, no listings found) returns a 422 with an actionable message.
+```
+GOOGLE_VISION_API_KEY=your-key
+EBAY_CLIENT_ID=your-app-id
+EBAY_CLIENT_SECRET=your-cert-id
+```
+
+```bash
+uvicorn app:app --reload --host 0.0.0.0
+```
+
+Frontend at `http://localhost:8000` · API docs at `http://localhost:8000/docs`
+
+`--host 0.0.0.0` makes the server reachable from other devices on the same network — useful for testing the camera UI on a phone.
+
+Set `EBAY_MOCK=true` to skip the eBay API and use the built-in price catalog instead. No credentials needed; useful for local development without network calls.
+
+## Try it
+
+```bash
+curl -X POST http://localhost:8000/appraise \
+     -F "file=@loveseat.jpg"
+```
+
+```json
+{
+  "item": "loveseat",
+  "labels": [
+    { "name": "loveseat",  "confidence": 0.9421 },
+    { "name": "furniture", "confidence": 0.8913 },
+    { "name": "couch",     "confidence": 0.8104 }
+  ],
+  "price_estimate": {
+    "low": 179.99,
+    "market_median": 241.49,
+    "estimated_resale_value": 144.89,
+    "high": 899.01,
+    "currency": "USD",
+    "sample_size": 20,
+    "is_mock": false,
+    "condition": "fair",
+    "multiplier_used": 0.6
+  }
+}
+```
+
+`estimated_resale_value` = `market_median × multiplier_used`. `is_mock: false` confirms prices came from real eBay listings.
 
 ## Running the tests
 
@@ -132,17 +128,13 @@ Label list and price estimate are combined into a single JSON response. External
 pytest tests/ -v
 ```
 
-35 tests covering unit logic for each module and FastAPI `TestClient` integration tests for the full request/response cycle, including error paths, cache behaviour, browser reuse, and mock fallback. Playwright calls are mocked — no browser or network required to run the suite.
+35 tests covering Vision parsing, eBay pricing logic, cache behaviour, and full request/response integration. No external calls required — all API calls are mocked.
 
-## Project structure
+## Tech stack
 
-```
-app.py              FastAPI service — routing, validation, orchestration
-vision.py           Google Cloud Vision client
-ebay.py             eBay scraper: Playwright, 2-hour cache, persistent browser, mock fallback
-tests/
-  test_vision.py    Unit tests for label detection and deduplication logic
-  test_ebay.py      Unit tests for scraper, cache, browser reuse, mock catalog
-  test_app.py       Integration tests via FastAPI TestClient (happy path + errors)
-.env.example        Credential setup instructions
-```
+- Python 3.11+
+- FastAPI + Starlette
+- Google Cloud Vision API (REST, plain API key)
+- eBay Browse API (OAuth 2.0 client credentials)
+- httpx
+- pytest

@@ -2,7 +2,10 @@ from dotenv import load_dotenv
 
 load_dotenv()  # must run before EbayClient reads env vars
 
+from pathlib import Path
+
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from ebay import EbayClient
@@ -91,3 +94,10 @@ async def appraise(
             multiplier_used=estimate.multiplier_used,
         ),
     )
+
+
+# Must come after all @app.get / @app.post routes — Starlette's router matches
+# in insertion order, so a Mount("/") placed earlier would intercept API paths.
+# html=True makes StaticFiles serve index.html for bare "/" requests.
+_FRONTEND = Path(__file__).parent / "frontend"
+app.mount("/", StaticFiles(directory=_FRONTEND, html=True), name="frontend")

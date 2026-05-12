@@ -7,6 +7,7 @@
 # even with correct TLS fingerprints. Playwright executes the challenge the same way
 # a real Chrome browser does, so it gets through to the actual search results.
 
+import base64
 import os
 import random
 import re
@@ -15,6 +16,7 @@ import time
 from dataclasses import dataclass
 from urllib.parse import urlencode
 
+import httpx
 from bs4 import BeautifulSoup
 from playwright.sync_api import Browser, Playwright, sync_playwright
 
@@ -73,12 +75,19 @@ class EbayClient:
         # Persistent browser — initialised lazily on first scrape call
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
+        # Browse API OAuth token cache
+        self._api_token: str | None = None
+        self._api_token_expiry: float = 0.0
 
     # -- public ----------------------------------------------------------------
 
     def search_prices(self, query: str, condition: str = "fair", limit: int = 20) -> PriceEstimate:
         if self._use_mock:
             return self._mock_estimate(query, condition)
+        if self._has_api_credentials():
+            result = self._browse_api_estimate(query, condition, limit)
+            if result is not None:
+                return result
         return self._scrape_estimate(query, condition, limit)
 
     def close(self) -> None:
@@ -95,6 +104,70 @@ class EbayClient:
             except Exception:
                 pass
             self._playwright = None
+
+    # -- browse api ------------------------------------------------------------
+
+    def _has_api_credentials(self) -> bool:
+        return bool(os.getenv("EBAY_CLIENT_ID")) and bool(os.getenv("EBAY_CLIENT_SECRET"))
+
+    def _fetch_api_token(self) -> str | None:
+        if self._api_token and time.monotonic() < self._api_token_expiry:
+            return self._api_token
+        client_id = os.getenv("EBAY_CLIENT_ID", "")
+        client_secret = os.getenv("EBAY_CLIENT_SECRET", "")
+        if not client_id or not client_secret:
+            return None
+        try:
+            creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+            resp = httpx.post(
+                "https://api.ebay.com/identity/v1/oauth2/token",
+                headers={
+                    "Authorization": f"Basic {creds}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data={
+                    "grant_type": "client_credentials",
+                    "scope": "https://api.ebay.com/oauth/api_scope",
+                },
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            self._api_token = payload["access_token"]
+            # Subtract a 60 s buffer so we refresh before the token actually expires
+            self._api_token_expiry = time.monotonic() + payload.get("expires_in", 7200) - 60
+            return self._api_token
+        except Exception:
+            return None
+
+    def _browse_api_estimate(self, query: str, condition: str, limit: int) -> PriceEstimate | None:
+        cached = self._cache_get(query)
+        if cached:
+            return self._build_estimate(cached, condition, limit)
+        try:
+            token = self._fetch_api_token()
+            if token is None:
+                return None
+            resp = httpx.get(
+                "https://api.ebay.com/buy/browse/v1/item_summary/search",
+                params={"q": query, "limit": limit},
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            items = resp.json().get("itemSummaries", [])
+            prices: list[float] = []
+            for item in items:
+                try:
+                    prices.append(float(item["price"]["value"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
+            if not prices:
+                return None
+            self._cache_set(query, prices)
+            return self._build_estimate(prices, condition, limit)
+        except Exception:
+            return None
 
     # -- cache -----------------------------------------------------------------
 
