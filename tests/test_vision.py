@@ -62,3 +62,15 @@ def test_returns_item_labels(mock_post):
     mock_post.return_value = _make_response(labels=[("Watch", 0.91)])
     results = VisionClient().identify_item(b"fake")
     assert all(isinstance(r, ItemLabel) for r in results)
+
+
+@patch("httpx.post")
+def test_api_key_sent_in_header_not_url(mock_post, monkeypatch):
+    monkeypatch.setenv("GOOGLE_VISION_API_KEY", "secret-key")
+    mock_post.return_value = _make_response()
+
+    VisionClient().identify_item(b"img")
+
+    _, kwargs = mock_post.call_args
+    assert kwargs["headers"] == {"X-Goog-Api-Key": "secret-key"}
+    assert "params" not in kwargs

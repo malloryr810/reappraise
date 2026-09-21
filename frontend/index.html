@@ -437,6 +437,17 @@
       outline-offset: 2px;
     }
 
+    /* ── History ─────────────────────────────────────── */
+    #history { display: none; }
+    #history.visible { display: block; }
+    #history-title { margin-top: 0; }
+
+    .history-meta {
+      display: block;
+      font-size: 0.72rem;
+      margin-top: 2px;
+    }
+
     /* ── Utility ─────────────────────────────────────── */
     .visually-hidden {
       position: absolute;
@@ -559,6 +570,12 @@
 
   </div>
 
+  <!-- ── History (GET /history) ─────────────── -->
+  <section class="card" id="history" aria-labelledby="history-title">
+    <h2 class="card-title" id="history-title">Recent Appraisals</h2>
+    <div id="history-list"></div>
+  </section>
+
 </main>
 
 <script>
@@ -652,6 +669,7 @@
       }
 
       renderResults(data);
+      loadHistory();
     } catch (_) {
       showError('Could not reach the server. Make sure the app is running.');
     } finally {
@@ -710,6 +728,50 @@
   function capitalize(str) {
     return str ? str.charAt(0).toUpperCase() + str.slice(1) : str;
   }
+
+  // ── History ───────────────────────────────────────────────────
+  // Stays hidden when persistence is off (/history → 503) or nothing is saved yet.
+  const historyCard = document.getElementById('history');
+  const historyList = document.getElementById('history-list');
+  const shortDate   = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
+
+  async function loadHistory() {
+    try {
+      const resp = await fetch('/history?limit=10');
+      if (!resp.ok) { hide(historyCard); return; }
+      const rows = await resp.json();
+      historyList.replaceChildren(...rows.map(historyRow));
+      rows.length ? show(historyCard) : hide(historyCard);
+    } catch (_) {
+      hide(historyCard);
+    }
+  }
+
+  // Built with textContent, never innerHTML — category text comes from Vision labels
+  function historyRow(row) {
+    const label = document.createElement('span');
+    label.className = 'detail-label';
+    label.textContent = capitalize(row.category);
+
+    const meta = document.createElement('span');
+    meta.className = 'history-meta';
+    const cond = CONDITION_LABELS[row.condition_label] ?? row.condition_label ?? '';
+    const parts = [cond, shortDate.format(new Date(row.created_at))];
+    if (row.source === 'mock') parts.push('estimated');
+    meta.textContent = parts.filter(Boolean).join(' · ');
+    label.append(meta);
+
+    const value = document.createElement('span');
+    value.className = 'detail-value';
+    value.textContent = row.estimated_price != null ? usd.format(row.estimated_price) : '—';
+
+    const el = document.createElement('div');
+    el.className = 'detail-row';
+    el.append(label, value);
+    return el;
+  }
+
+  loadHistory();
 </script>
 
 </body>

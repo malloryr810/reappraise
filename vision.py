@@ -23,7 +23,9 @@ class VisionClient:
     def identify_item(self, image_bytes: bytes) -> list[ItemLabel]:
         response = httpx.post(
             _ANNOTATE_URL,
-            params={"key": self._api_key},
+            # Header rather than ?key= so the key never appears in the URL —
+            # httpx includes the full URL in HTTPStatusError messages
+            headers={"X-Goog-Api-Key": self._api_key},
             json={
                 "requests": [{
                     "image": {"content": base64.b64encode(image_bytes).decode()},

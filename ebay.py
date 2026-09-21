@@ -17,8 +17,22 @@ from dataclasses import dataclass
 from urllib.parse import urlencode
 
 import httpx
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Tag
 from playwright.sync_api import Browser, Playwright, sync_playwright
+
+
+# Values for PriceEstimate.source — persisted to price_estimates.source.
+# The Browse API only returns active listings (asking prices), while the scraper
+# reads completed/sold listings, so the two are kept distinguishable in storage.
+SOURCE_BROWSE_API = "browse_api"
+SOURCE_SOLD_SCRAPE = "sold_scrape"
+SOURCE_MOCK = "mock"
+
+
+@dataclass(frozen=True)
+class SampledListing:
+    price: float
+    ebay_listing_id: str | None = None
 
 
 @dataclass
@@ -32,6 +46,15 @@ class PriceEstimate:
     is_mock: bool
     condition: str
     multiplier_used: float
+    source: str
+    # The individual listings the median was computed from; empty for mock
+    listings: tuple[SampledListing, ...] = ()
+
+
+@dataclass(frozen=True)
+class _CachedSample:
+    listings: tuple[SampledListing, ...]
+    source: str
 
 
 _MOCK_CATALOG: dict[str, tuple[float, float, float]] = {
@@ -63,6 +86,7 @@ CONDITION_MULTIPLIERS: dict[str, float] = {
 
 _EBAY_SEARCH_URL = "https://www.ebay.com/sch/i.html"
 _PRICE_STRIP = re.compile(r"[$,]")
+_ITEM_URL_ID = re.compile(r"/itm/(?:[^/?#]+/)?(\d+)")
 _CACHE_TTL = 2 * 3600  # 2 hours in seconds
 
 
@@ -70,8 +94,8 @@ class EbayClient:
     def __init__(self) -> None:
         self._use_mock = os.getenv("EBAY_MOCK", "false").lower() == "true"
         self._last_request_at: float = 0.0
-        # In-memory price cache: normalized_query → (monotonic_ts, prices)
-        self._price_cache: dict[str, tuple[float, list[float]]] = {}
+        # In-memory price cache: normalized_query → (monotonic_ts, sample)
+        self._price_cache: dict[str, tuple[float, _CachedSample]] = {}
         # Persistent browser — initialised lazily on first scrape call
         self._playwright: Playwright | None = None
         self._browser: Browser | None = None
@@ -156,16 +180,19 @@ class EbayClient:
             )
             resp.raise_for_status()
             items = resp.json().get("itemSummaries", [])
-            prices: list[float] = []
+            listings: list[SampledListing] = []
             for item in items:
                 try:
-                    prices.append(float(item["price"]["value"]))
+                    price = float(item["price"]["value"])
                 except (KeyError, ValueError, TypeError):
                     continue
-            if not prices:
+                listing_id = item.get("legacyItemId") or item.get("itemId")
+                listings.append(SampledListing(price, str(listing_id) if listing_id else None))
+            if not listings:
                 return None
-            self._cache_set(query, prices)
-            return self._build_estimate(prices, condition, limit)
+            sample = _CachedSample(tuple(listings), SOURCE_BROWSE_API)
+            self._cache_set(query, sample)
+            return self._build_estimate(sample, condition, limit)
         except Exception:
             return None
 
@@ -174,18 +201,18 @@ class EbayClient:
     def _cache_key(self, query: str) -> str:
         return query.strip().lower()
 
-    def _cache_get(self, query: str) -> list[float] | None:
+    def _cache_get(self, query: str) -> _CachedSample | None:
         entry = self._price_cache.get(self._cache_key(query))
         if entry is None:
             return None
-        ts, prices = entry
+        ts, sample = entry
         if time.monotonic() - ts > _CACHE_TTL:
             del self._price_cache[self._cache_key(query)]
             return None
-        return prices
+        return sample
 
-    def _cache_set(self, query: str, prices: list[float]) -> None:
-        self._price_cache[self._cache_key(query)] = (time.monotonic(), prices)
+    def _cache_set(self, query: str, sample: _CachedSample) -> None:
+        self._price_cache[self._cache_key(query)] = (time.monotonic(), sample)
 
     # -- browser ---------------------------------------------------------------
 
@@ -207,9 +234,10 @@ class EbayClient:
             time.sleep(gap - elapsed)
         self._last_request_at = time.monotonic()
 
-    def _build_estimate(self, prices: list[float], condition: str, limit: int) -> PriceEstimate:
+    def _build_estimate(self, sample: _CachedSample, condition: str, limit: int) -> PriceEstimate:
         multiplier = CONDITION_MULTIPLIERS.get(condition, CONDITION_MULTIPLIERS["fair"])
-        prices = prices[:limit]
+        listings = sample.listings[:limit]
+        prices = [listing.price for listing in listings]
         # Median is more resistant to outliers than mean — one $5,000 listing
         # shouldn't inflate the estimate for an item that typically sells for $50
         market_median = round(statistics.median(prices), 2)
@@ -223,6 +251,8 @@ class EbayClient:
             is_mock=False,
             condition=condition,
             multiplier_used=multiplier,
+            source=sample.source,
+            listings=listings,
         )
 
     def _scrape_estimate(self, query: str, condition: str, limit: int) -> PriceEstimate:
@@ -251,7 +281,7 @@ class EbayClient:
                 page.close()
 
             soup = BeautifulSoup(html, "html.parser")
-            prices: list[float] = []
+            listings: list[SampledListing] = []
             for el in soup.select("span.s-card__price"):
                 # Skip crossed-out asking prices on Best-Offer-accepted listings —
                 # the actual accepted amount is not disclosed, so the number is wrong
@@ -263,23 +293,25 @@ class EbayClient:
                     continue
                 cleaned = _PRICE_STRIP.sub("", text).strip()
                 try:
-                    prices.append(float(cleaned))
+                    price = float(cleaned)
                 except ValueError:
                     continue
+                listings.append(SampledListing(price, _scraped_listing_id(el)))
 
-            prices = prices[:limit]
+            listings = listings[:limit]
         except Exception:
             # Any browser or network error — fall back to mock so the pipeline
             # keeps running rather than returning a 502 to the caller
             return self._mock_estimate(query, condition)
 
-        if not prices:
+        if not listings:
             # Page loaded but no parseable prices (bot-check, zero results, layout
             # change) — fall back to mock rather than returning a dead estimate
             return self._mock_estimate(query, condition)
 
-        self._cache_set(query, prices)
-        return self._build_estimate(prices, condition, limit)
+        sample = _CachedSample(tuple(listings), SOURCE_SOLD_SCRAPE)
+        self._cache_set(query, sample)
+        return self._build_estimate(sample, condition, limit)
 
     # -- mock ------------------------------------------------------------------
 
@@ -300,4 +332,24 @@ class EbayClient:
             is_mock=True,
             condition=condition,
             multiplier_used=multiplier,
+            source=SOURCE_MOCK,
         )
+
+
+def _scraped_listing_id(price_el: Tag) -> str | None:
+    """Best-effort eBay item ID for a result card, or None if not exposed.
+
+    Checks the card's data-listingid attribute first, then falls back to the
+    numeric ID in the card's /itm/ link.
+    """
+    card = price_el.find_parent("li")
+    if card is None:
+        return None
+    listing_id = card.get("data-listingid")
+    if listing_id:
+        return str(listing_id)
+    link = card.find("a", href=_ITEM_URL_ID)
+    if link is None:
+        return None
+    match = _ITEM_URL_ID.search(link["href"])
+    return match.group(1) if match else None

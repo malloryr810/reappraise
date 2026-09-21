@@ -2,14 +2,23 @@ from dotenv import load_dotenv
 
 load_dotenv()  # must run before EbayClient reads env vars
 
+import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from pymysql.connections import Connection
 
-from ebay import EbayClient
+import repository
+from db import DbConfig, connect
+from ebay import CONDITION_MULTIPLIERS, EbayClient, PriceEstimate
 from vision import VisionClient
+
+logger = logging.getLogger("reappraise")
 
 
 class LabelOut(BaseModel):
@@ -33,10 +42,80 @@ class AppraiseResponse(BaseModel):
     item: str
     labels: list[LabelOut]
     price_estimate: PriceOut
+    # None when persistence is disabled or the save failed
+    item_id: int | None = None
+
+
+class HistoryEntry(BaseModel):
+    estimate_id: int
+    item_id: int
+    category: str
+    description: str | None
+    condition_label: str | None
+    condition_multiplier: float | None
+    market_median: float | None
+    estimated_price: float | None
+    source: str
+    created_at: datetime
+    sample_size: int
+    low: float | None
+    high: float | None
+
+
+class EstimateOut(BaseModel):
+    estimate_id: int
+    market_median: float | None
+    estimated_price: float | None
+    source: str
+    created_at: datetime
+
+
+class ListingOut(BaseModel):
+    listing_id: int
+    ebay_listing_id: str | None
+    sampled_price: float | None
+    sampled_at: datetime
+
+
+class ItemDetailOut(BaseModel):
+    item_id: int
+    category: str
+    description: str | None
+    condition_label: str | None
+    condition_multiplier: float | None
+    created_at: datetime
+    estimates: list[EstimateOut]
+    listings: list[ListingOut]
+
+
+class CategoryStat(BaseModel):
+    category: str
+    item_count: int
+    avg_estimated_price: float | None
+    avg_market_median: float | None
+
+
+class BelowMarketItem(BaseModel):
+    item_id: int
+    category: str
+    description: str | None
+    condition_label: str | None
+    market_median: float | None
+    estimated_price: float | None
+    category_avg_median: float | None
+    ratio_to_category: float | None
+
+
+class CategoryVolume(BaseModel):
+    category: str
+    item_count: int
 
 
 _vision = VisionClient()
 _ebay = EbayClient()
+_db_config = DbConfig.from_env()
+if _db_config is None:
+    logger.warning("MYSQL_DATABASE not set — appraisals will not be persisted")
 
 app = FastAPI(title="Reappraise", version="0.1.0")
 
@@ -46,11 +125,50 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@contextmanager
+def _db() -> Iterator[Connection]:
+    """Connection for read endpoints; 503 if persistence isn't configured."""
+    if _db_config is None:
+        raise HTTPException(status_code=503, detail="Persistence is not configured")
+    try:
+        with connect(_db_config) as conn:
+            yield conn
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Database error")
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+
+def _persist(category: str, description: str, estimate: PriceEstimate) -> int | None:
+    """Save an appraisal; returns item_id, or None if disabled or the save failed.
+
+    A database outage shouldn't cost the user their price estimate, so failures
+    are logged with full context and the appraisal is still returned.
+    """
+    if _db_config is None:
+        return None
+    try:
+        with connect(_db_config) as conn:
+            return repository.save_appraisal(
+                conn, category=category, description=description, estimate=estimate
+            )
+    except Exception:
+        logger.exception("Failed to persist appraisal for %r", category)
+        return None
+
+
 @app.post("/appraise", response_model=AppraiseResponse)
 async def appraise(
     file: UploadFile = File(...),
     condition: str = Query(default="fair"),
 ) -> AppraiseResponse:
+    if condition not in CONDITION_MULTIPLIERS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"condition must be one of: {', '.join(CONDITION_MULTIPLIERS)}",
+        )
+
     if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
 
@@ -61,7 +179,9 @@ async def appraise(
     try:
         labels = _vision.identify_item(image_bytes)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Vision API error: {exc}") from exc
+        # Upstream error text can contain request details; keep it in server logs
+        logger.exception("Vision API call failed")
+        raise HTTPException(status_code=502, detail="Vision API error") from exc
 
     if not labels:
         raise HTTPException(status_code=422, detail="No items detected in image")
@@ -71,13 +191,16 @@ async def appraise(
     try:
         estimate = _ebay.search_prices(query, condition=condition)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"eBay API error: {exc}") from exc
+        logger.exception("eBay price lookup failed")
+        raise HTTPException(status_code=502, detail="eBay API error") from exc
 
     if estimate.sample_size == 0:
         raise HTTPException(
             status_code=422,
             detail=f"No eBay listings found for '{labels[0].name}' — try a clearer photo",
         )
+
+    item_id = _persist(category=labels[0].name, description=query, estimate=estimate)
 
     return AppraiseResponse(
         item=labels[0].name,
@@ -93,7 +216,47 @@ async def appraise(
             condition=estimate.condition,
             multiplier_used=estimate.multiplier_used,
         ),
+        item_id=item_id,
     )
+
+
+@app.get("/history", response_model=list[HistoryEntry])
+def history(limit: int = Query(default=20, ge=1, le=100)) -> list[dict]:
+    with _db() as conn:
+        return repository.recent_estimates(conn, limit=limit)
+
+
+@app.get("/history/{item_id}", response_model=ItemDetailOut)
+def history_item(item_id: int) -> dict:
+    with _db() as conn:
+        detail = repository.get_item_detail(conn, item_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"No item with id {item_id}")
+    return {**detail.item, "estimates": detail.estimates, "listings": detail.listings}
+
+
+@app.get("/analytics/categories", response_model=list[CategoryStat])
+def analytics_categories() -> list[dict]:
+    with _db() as conn:
+        return repository.avg_price_by_category(conn)
+
+
+@app.get("/analytics/below-market", response_model=list[BelowMarketItem])
+def analytics_below_market(
+    ratio: float = Query(default=0.5, gt=0, le=1),
+    min_peers: int = Query(default=3, ge=2),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[dict]:
+    with _db() as conn:
+        return repository.below_category_market(
+            conn, ratio=ratio, min_peers=min_peers, limit=limit
+        )
+
+
+@app.get("/analytics/top-category", response_model=list[CategoryVolume])
+def analytics_top_category() -> list[dict]:
+    with _db() as conn:
+        return repository.top_category_by_volume(conn)
 
 
 # Must come after all @app.get / @app.post routes — Starlette's router matches

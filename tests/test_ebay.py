@@ -332,3 +332,76 @@ def test_browser_relaunches_after_disconnect(monkeypatch):
     # browser1 was disconnected, so _get_page() launched browser2 and used it
     assert pw_instance.chromium.launch.call_count == 1
     assert browser2.new_page.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Per-listing data (persisted to listings_sampled)
+# ---------------------------------------------------------------------------
+
+def test_mock_estimate_has_no_listings_and_mock_source(monkeypatch):
+    monkeypatch.setenv("EBAY_MOCK", "true")
+    estimate = EbayClient().search_prices("camera")
+    assert estimate.source == ebay.SOURCE_MOCK
+    assert estimate.listings == ()
+
+
+def test_scraper_captures_listing_ids(monkeypatch):
+    monkeypatch.delenv("EBAY_MOCK", raising=False)
+    html = (
+        "<html><body><ul>"
+        '<li data-listingid="111"><span class="s-card__price">$10.00</span></li>'
+        '<li><a href="https://www.ebay.com/itm/222?hash=x">link</a>'
+        '<span class="s-card__price">$20.00</span></li>'
+        '<li><a href="https://www.ebay.com/itm/some-title-slug/333">link</a>'
+        '<span class="s-card__price">$30.00</span></li>'
+        '<li><span class="s-card__price">$40.00</span></li>'
+        "</ul></body></html>"
+    )
+    with patch("ebay.sync_playwright", _make_playwright_mock(html)):
+        estimate = EbayClient().search_prices("lamp")
+
+    assert estimate.source == ebay.SOURCE_SOLD_SCRAPE
+    assert [(l.price, l.ebay_listing_id) for l in estimate.listings] == [
+        (10.0, "111"), (20.0, "222"), (30.0, "333"), (40.0, None),
+    ]
+
+
+def test_cache_hit_preserves_listings_and_source(monkeypatch):
+    monkeypatch.delenv("EBAY_MOCK", raising=False)
+    html = _price_html("$10.00", "$20.00")
+    client = EbayClient()
+    with patch("ebay.sync_playwright", _make_playwright_mock(html)):
+        first = client.search_prices("lamp")
+        second = client.search_prices("lamp", condition="good")
+
+    assert second.listings == first.listings
+    assert second.source == ebay.SOURCE_SOLD_SCRAPE
+
+
+def test_browse_api_captures_listing_ids(monkeypatch):
+    monkeypatch.delenv("EBAY_MOCK", raising=False)
+    monkeypatch.setenv("EBAY_CLIENT_ID", "id")
+    monkeypatch.setenv("EBAY_CLIENT_SECRET", "secret")
+
+    token_resp = MagicMock()
+    token_resp.json.return_value = {"access_token": "tok", "expires_in": 7200}
+    search_resp = MagicMock()
+    search_resp.json.return_value = {"itemSummaries": [
+        {"legacyItemId": "110001", "itemId": "v1|110001|0", "price": {"value": "12.50"}},
+        {"itemId": "v1|110002|0", "price": {"value": "30.00"}},
+        {"legacyItemId": "110003", "price": {"value": "not-a-number"}},
+        {"price": {"value": "20.00"}},
+    ]}
+
+    with (
+        patch("ebay.httpx.post", return_value=token_resp),
+        patch("ebay.httpx.get", return_value=search_resp),
+    ):
+        estimate = EbayClient().search_prices("drill")
+
+    assert estimate.source == ebay.SOURCE_BROWSE_API
+    assert estimate.is_mock is False
+    assert [(l.price, l.ebay_listing_id) for l in estimate.listings] == [
+        (12.5, "110001"), (30.0, "v1|110002|0"), (20.0, None),
+    ]
+    assert estimate.market_median == 20.0

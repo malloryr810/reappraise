@@ -1,3 +1,6 @@
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "integration: needs a real MySQL database (MYSQL_TEST_DATABASE); skipped when unavailable",
+]
