@@ -27,10 +27,17 @@ class ItemDetail:
 
 
 def save_appraisal(
-    conn: Connection, *, category: str, description: str, estimate: PriceEstimate
+    conn: Connection,
+    *,
+    category: str,
+    description: str,
+    estimate: PriceEstimate,
+    user_description: str | None = None,
 ) -> int:
     """Persist one appraisal (category, item, sampled listings, estimate).
 
+    `description` is Vision's labels and `user_description` is what a volunteer
+    typed; they are stored separately so the two are never mixed up.
     Returns the new item_id. The caller's `with connect(...)` block makes this
     all-or-nothing.
     """
@@ -43,6 +50,7 @@ def save_appraisal(
             {
                 "category_id": category_id,
                 "description": description[:_DESCRIPTION_MAX],
+                "user_description": user_description,
                 "condition_label": estimate.condition,
                 "condition_multiplier": estimate.multiplier_used,
             },
@@ -69,6 +77,8 @@ def save_appraisal(
                 "market_median": estimate.market_median,
                 "estimated_price": estimate.estimated_resale_value,
                 "source": estimate.source,
+                "search_term": estimate.search_term,
+                "search_source": estimate.search_source,
             },
         )
     return item_id
@@ -111,8 +121,9 @@ def recompute_estimate(
     market_median: Decimal = median_row["market_median"]
     factor = Decimal(str(multiplier)) if multiplier is not None else detail.item["condition_multiplier"]
     estimated = (market_median * factor).quantize(Decimal("0.01"))
-    # Listings came from the same place as the original estimate
-    source = detail.estimates[-1]["source"]
+    # Listings came from the same place, and the same search, as the original estimate
+    original = detail.estimates[-1]
+    source = original["source"]
 
     with conn.cursor() as cur:
         cur.execute(
@@ -122,6 +133,8 @@ def recompute_estimate(
                 "market_median": market_median,
                 "estimated_price": estimated,
                 "source": source,
+                "search_term": original["search_term"],
+                "search_source": original["search_source"],
             },
         )
         estimate_id = cur.lastrowid

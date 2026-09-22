@@ -6,6 +6,7 @@ table is truncated before each test.
 """
 
 import statistics
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import patch
 
@@ -16,8 +17,11 @@ from fastapi.testclient import TestClient
 
 import app as app_module
 import repository
-from db import DbConfig, connect, init_schema
-from ebay import SOURCE_BROWSE_API, SOURCE_MOCK, PriceEstimate, SampledListing
+from db import DbConfig, applied_migrations, connect, init_schema, migration_files
+from ebay import (
+    SEARCH_SOURCE_USER, SEARCH_SOURCE_VISION, SOURCE_BROWSE_API, SOURCE_MOCK,
+    PriceEstimate, SampledListing,
+)
 from vision import ItemLabel
 
 pytestmark = pytest.mark.integration
@@ -84,6 +88,62 @@ def _count(config, table: str) -> int:
         return cur.fetchone()["n"]
 
 
+def _columns(config, table: str) -> set[str]:
+    with connect(config) as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s",
+            (table,),
+        )
+        return {r["COLUMN_NAME"] for r in cur.fetchall()}
+
+
+# ---------------------------------------------------------------------------
+# Migrations
+# ---------------------------------------------------------------------------
+
+def test_init_schema_applies_every_migration(db_config):
+    assert "user_description" in _columns(db_config, "items")
+    assert {"search_term", "search_source"} <= _columns(db_config, "price_estimates")
+    with connect(db_config) as conn:
+        assert applied_migrations(conn) == {version for version, _ in migration_files()}
+
+
+def test_migration_upgrades_a_database_created_before_it(db_config):
+    _save(db_config, "lamp", [10.0, 20.0])  # existing data must survive the upgrade
+    # Rewind the test database to the pre-migration shape a real dev database has
+    with connect(db_config) as conn, conn.cursor() as cur:
+        cur.execute("ALTER TABLE items DROP COLUMN user_description")
+        cur.execute("ALTER TABLE price_estimates DROP CHECK chk_estimates_search_source")
+        cur.execute("ALTER TABLE price_estimates DROP COLUMN search_term, DROP COLUMN search_source")
+        cur.execute("DELETE FROM schema_migrations")
+    try:
+        assert "user_description" not in _columns(db_config, "items")
+
+        applied = init_schema(db_config)
+
+        assert applied == [version for version, _ in migration_files()]
+        assert "user_description" in _columns(db_config, "items")
+        assert {"search_term", "search_source"} <= _columns(db_config, "price_estimates")
+        assert _count(db_config, "items") == 1
+        assert _count(db_config, "listings_sampled") == 2
+    finally:
+        init_schema(db_config)  # leave the test database migrated for later tests
+
+
+def test_init_schema_is_idempotent(db_config):
+    assert init_schema(db_config) == []
+    assert init_schema(db_config) == []
+
+
+def test_search_source_check_constraint_rejects_unknown_values(db_config):
+    item_id = _save(db_config, "lamp", [10.0])
+    with pytest.raises(pymysql.err.OperationalError), connect(db_config) as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE price_estimates SET search_source = 'bogus' WHERE item_id = %s", (item_id,)
+        )
+
+
 # ---------------------------------------------------------------------------
 # Write path
 # ---------------------------------------------------------------------------
@@ -106,6 +166,50 @@ def test_save_appraisal_writes_all_four_tables(db_config):
     assert estimate["market_median"] == Decimal("20.00")
     assert estimate["estimated_price"] == Decimal("14.00")
     assert estimate["source"] == SOURCE_BROWSE_API
+
+
+def test_user_description_and_search_term_are_persisted(db_config):
+    estimate = replace(
+        _estimate([900.0, 1500.0, 2100.0]),
+        search_term="Trek Emonda SL 5", search_source=SEARCH_SOURCE_USER,
+    )
+    with connect(db_config) as conn:
+        item_id = repository.save_appraisal(
+            conn, category="bicycle", description="bicycle bicycle tire wheel",
+            estimate=estimate, user_description="Trek Emonda SL 5",
+        )
+        detail = repository.get_item_detail(conn, item_id)
+        [history] = repository.recent_estimates(conn, limit=5)
+
+    assert detail.item["user_description"] == "Trek Emonda SL 5"
+    assert detail.item["description"] == "bicycle bicycle tire wheel"  # Vision kept apart
+    assert detail.estimates[0]["search_term"] == "Trek Emonda SL 5"
+    assert detail.estimates[0]["search_source"] == SEARCH_SOURCE_USER
+    assert (history["user_description"], history["search_source"]) == (
+        "Trek Emonda SL 5", SEARCH_SOURCE_USER,
+    )
+
+
+def test_vision_only_appraisal_leaves_user_description_null(db_config):
+    item_id = _save(db_config, "lamp", [10.0])
+
+    with connect(db_config) as conn:
+        detail = repository.get_item_detail(conn, item_id)
+    assert detail.item["user_description"] is None
+
+
+def test_recompute_keeps_the_original_search_term(db_config):
+    estimate = replace(_estimate([10.0, 20.0]), search_term="lamp", search_source=SEARCH_SOURCE_VISION)
+    with connect(db_config) as conn:
+        item_id = repository.save_appraisal(
+            conn, category="lamp", description="lamp", estimate=estimate,
+        )
+        repository.recompute_estimate(conn, item_id, multiplier=0.8)
+        detail = repository.get_item_detail(conn, item_id)
+
+    assert [(e["search_term"], e["search_source"]) for e in detail.estimates] == [
+        ("lamp", SEARCH_SOURCE_VISION), ("lamp", SEARCH_SOURCE_VISION),
+    ]
 
 
 def test_category_is_reused_across_appraisals(db_config):
@@ -324,5 +428,36 @@ def test_appraise_persists_and_history_reads_it_back(db_config, monkeypatch):
 
     assert client.get("/analytics/categories").json()[0]["category"] == "camera"
     assert client.get("/analytics/top-category").json() == [{"category": "camera", "item_count": 1}]
+    assert history[0]["user_description"] is None
     [price_range] = client.get("/analytics/price-range").json()
     assert (price_range["category"], price_range["price_range"]) == ("camera", 310.0)
+
+
+def test_appraise_with_description_round_trips_through_history(db_config, monkeypatch):
+    monkeypatch.setattr(app_module, "_db_config", db_config)
+    estimate = replace(
+        _estimate([900.0, 1500.0, 2100.0]),
+        search_term="Trek Emonda SL 5", search_source=SEARCH_SOURCE_USER,
+    )
+    client = TestClient(app_module.app)
+
+    with (
+        patch.object(app_module._vision, "identify_item",
+                     return_value=[ItemLabel("bicycle", 0.95), ItemLabel("wheel", 0.8)]),
+        patch.object(app_module._ebay, "search_labels", return_value=estimate),
+    ):
+        resp = client.post(
+            "/appraise",
+            files={"file": ("x.jpg", b"\xff\xd8\xff", "image/jpeg")},
+            data={"user_description": "Trek Emonda SL 5"},
+        )
+
+    item_id = resp.json()["item_id"]
+    [row] = client.get("/history").json()
+    assert row["item_id"] == item_id
+    assert row["category"] == "bicycle"
+    assert row["user_description"] == "Trek Emonda SL 5"
+    assert (row["search_term"], row["search_source"]) == ("Trek Emonda SL 5", "user_description")
+    detail = client.get(f"/history/{item_id}").json()
+    assert detail["user_description"] == "Trek Emonda SL 5"
+    assert detail["estimates"][0]["search_source"] == "user_description"

@@ -19,6 +19,7 @@ from pymysql.connections import Connection
 from pymysql.cursors import DictCursor
 
 _SQL_DIR = Path(__file__).parent / "sql"
+_MIGRATIONS_DIR = _SQL_DIR / "migrations"
 _NAME_HEADER = re.compile(r"^--\s*name:\s*(\w+)\s*$", re.MULTILINE)
 _COMMENT_LINE = re.compile(r"^\s*--.*$", re.MULTILINE)
 _CONNECT_TIMEOUT_S = 5
@@ -98,16 +99,49 @@ def query(name: str) -> str:
         raise KeyError(f"No query named {name!r} in sql/queries.sql") from None
 
 
-def schema_statements() -> list[str]:
-    text = _strip_comments((_SQL_DIR / "schema.sql").read_text())
+def _statements(path: Path) -> list[str]:
+    text = _strip_comments(path.read_text())
     return [stmt.strip() for stmt in text.split(";") if stmt.strip()]
 
 
-def init_schema(config: DbConfig) -> None:
-    """Create any missing tables. Safe to run repeatedly."""
-    with connect(config) as conn, conn.cursor() as cur:
-        for stmt in schema_statements():
-            cur.execute(stmt)
+def schema_statements() -> list[str]:
+    return _statements(_SQL_DIR / "schema.sql")
+
+
+def migration_files() -> list[tuple[str, Path]]:
+    """(version, path) for every sql/migrations/NNN_*.sql file, oldest first."""
+    return [(path.stem, path) for path in sorted(_MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"))]
+
+
+def applied_migrations(conn: Connection) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(query("applied_migrations"))
+        return {row["version"] for row in cur.fetchall()}
+
+
+def init_schema(config: DbConfig) -> list[str]:
+    """Create any missing tables, then apply pending migrations in order.
+
+    Safe to run repeatedly. Returns the versions applied by this call. MySQL
+    commits each ALTER TABLE implicitly, so every migration is recorded as soon
+    as it runs; a failure stops the run and leaves later migrations pending.
+    """
+    applied_now: list[str] = []
+    with connect(config) as conn:
+        with conn.cursor() as cur:
+            for stmt in schema_statements():
+                cur.execute(stmt)
+        done = applied_migrations(conn)
+        for version, path in migration_files():
+            if version in done:
+                continue
+            with conn.cursor() as cur:
+                for stmt in _statements(path):
+                    cur.execute(stmt)
+                cur.execute(query("record_migration"), {"version": version})
+            conn.commit()
+            applied_now.append(version)
+    return applied_now
 
 
 if __name__ == "__main__":
@@ -119,5 +153,6 @@ if __name__ == "__main__":
     cfg = DbConfig.from_env()
     if cfg is None:
         sys.exit("MYSQL_DATABASE is not set — see .env.example")
-    init_schema(cfg)
+    applied = init_schema(cfg)
+    print(f"Applied migrations: {', '.join(applied)}" if applied else "No pending migrations")
     print(f"Schema ready in {cfg.database}@{cfg.host}:{cfg.port}")

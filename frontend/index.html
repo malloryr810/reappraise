@@ -227,6 +227,28 @@
       outline-offset: 2px;
     }
 
+    /* ── Description input ───────────────────────────── */
+    label.card-title { display: block; }
+
+    #input-description {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 1rem; /* 16px+ stops iOS zooming into the field */
+      color: var(--text);
+      background: var(--surface);
+    }
+
+    #input-description::placeholder { color: var(--text-2); opacity: 0.8; }
+
+    #input-description:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 1px;
+      border-color: var(--primary);
+    }
+
     /* ── Submit button ───────────────────────────────── */
     #btn-submit {
       width: 100%;
@@ -522,6 +544,14 @@
     </div>
   </div>
 
+  <!-- ── Description (optional) ─────────────── -->
+  <div class="card">
+    <label class="card-title" for="input-description">Know more about this item? (optional)</label>
+    <input type="text" id="input-description" name="user_description"
+           maxlength="255" autocomplete="off"
+           placeholder="e.g. Trek Émonda SL 5, KitchenAid stand mixer">
+  </div>
+
   <!-- ── Submit ─────────────────────────────── -->
   <button type="button" id="btn-submit" disabled>Price This Item</button>
 
@@ -564,6 +594,12 @@
         <span class="detail-label">Sample size</span>
         <span class="detail-value" id="res-sample"></span>
       </div>
+      <div class="detail-row">
+        <span class="detail-label">Searched eBay for
+          <span class="history-meta" id="res-search-note"></span>
+        </span>
+        <span class="detail-value" id="res-search"></span>
+      </div>
     </div>
 
     <button type="button" id="btn-reset">Price Another Item</button>
@@ -594,6 +630,7 @@
   const errorBox     = document.getElementById('error-box');
   const errorMsg     = document.getElementById('error-msg');
   const results      = document.getElementById('results');
+  const inputDescription = document.getElementById('input-description');
 
   // ── State ─────────────────────────────────────────────────────
   let selectedFile    = null;
@@ -642,6 +679,8 @@
     const condition = getCondition();
     const body = new FormData();
     body.append('file', selectedFile);
+    const description = inputDescription.value.trim();
+    if (description) body.append('user_description', description);
 
     show(loading);
     hide(errorBox);
@@ -681,6 +720,7 @@
   // ── Reset ─────────────────────────────────────────────────────
   document.getElementById('btn-reset').addEventListener('click', () => {
     clearPhoto();
+    inputDescription.value = '';
     hide(results);
     hide(errorBox);
   });
@@ -711,9 +751,30 @@
     document.getElementById('res-condition').textContent  = condLabel;
     document.getElementById('res-range').textContent     = `${usd.format(est.low)} – ${usd.format(est.high)}`;
     document.getElementById('res-sample').textContent    = `${est.sample_size} eBay listing${est.sample_size !== 1 ? 's' : ''}`;
+    renderSearch(data);
 
     show(results);
     results.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  // Built with textContent, never innerHTML — the search term can be the volunteer's own text
+  function renderSearch(data) {
+    const searchEl = document.getElementById('res-search');
+    const noteEl   = document.getElementById('res-search-note');
+    searchEl.textContent = data.search_term ? `“${data.search_term}”` : 'Catalog estimate';
+    noteEl.textContent = searchNote(data);
+  }
+
+  const SEARCH_SOURCE_LABELS = {
+    user_description: 'your description',
+    vision_label: 'photo label',
+  };
+
+  // Which input set the price. Flags a description that was given but found too few listings.
+  function searchNote(row) {
+    const note = SEARCH_SOURCE_LABELS[row.search_source] ?? '';
+    const descriptionUnused = row.user_description && row.search_source !== 'user_description';
+    return descriptionUnused ? 'description had too few matches' : note;
   }
 
   // ── Helpers ───────────────────────────────────────────────────
@@ -758,6 +819,8 @@
     const cond = CONDITION_LABELS[row.condition_label] ?? row.condition_label ?? '';
     const parts = [cond, shortDate.format(new Date(row.created_at))];
     if (row.source === 'mock') parts.push('estimated');
+    if (row.search_source === 'user_description') parts.push('priced from your description');
+    else if (row.user_description) parts.push('description had too few matches');
     meta.textContent = parts.filter(Boolean).join(' · ');
     label.append(meta);
 

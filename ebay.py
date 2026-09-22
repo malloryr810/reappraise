@@ -10,7 +10,7 @@ import os
 import re
 import statistics
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import httpx
 
@@ -20,6 +20,10 @@ import httpx
 # accepted by the schema for historical rows but is no longer produced.
 SOURCE_BROWSE_API = "browse_api"
 SOURCE_MOCK = "mock"
+
+# Values for PriceEstimate.search_source — persisted to price_estimates.search_source.
+SEARCH_SOURCE_USER = "user_description"
+SEARCH_SOURCE_VISION = "vision_label"
 
 logger = logging.getLogger("reappraise.ebay")
 
@@ -33,7 +37,7 @@ _HTTP_TIMEOUT_S = 10.0
 _ERROR_BODY_MAX_CHARS = 300
 
 # A median of fewer listings than this is too noisy to trust, so the next
-# Vision label is tried before settling for it
+# search term is tried before settling for it
 _MIN_LISTINGS = 5
 # Each label costs one API call, and lower-confidence labels describe the item
 # less reliably, so broadening stops after the top few usable labels
@@ -67,6 +71,23 @@ def specific_labels(labels: list[str]) -> list[str]:
     ]
 
 
+def _search_terms(labels: list[str], user_description: str | None) -> list[tuple[str, str]]:
+    """Ordered (term, source) pairs to search: the description, then Vision labels.
+
+    The description is a person's judgement, so it is searched as given and is
+    never subject to the generic-label filter or the Vision label budget.
+    """
+    description = (user_description or "").strip()
+    terms = [(description, SEARCH_SOURCE_USER)] if description else []
+
+    vision = specific_labels(labels)
+    if not vision and labels:
+        logger.warning("All Vision labels are too generic to search: %r", labels)
+    elif vision and vision[0] != labels[0]:
+        logger.warning("Skipping generic label(s) %r", labels[:labels.index(vision[0])])
+    return terms + [(label, SEARCH_SOURCE_VISION) for label in vision[:_MAX_LABELS_TO_TRY]]
+
+
 @dataclass(frozen=True)
 class SampledListing:
     price: float
@@ -87,6 +108,9 @@ class PriceEstimate:
     source: str
     # The individual listings the median was computed from; empty for mock
     listings: tuple[SampledListing, ...] = ()
+    # The eBay query that produced the listings and where it came from; None for mock
+    search_term: str | None = None
+    search_source: str | None = None
 
 
 _MOCK_CATALOG: dict[str, tuple[float, float, float]] = {
@@ -129,50 +153,52 @@ class EbayClient:
     # -- public ----------------------------------------------------------------
 
     def search_labels(
-        self, labels: list[str], condition: str = "fair", limit: int = 20
+        self,
+        labels: list[str],
+        condition: str = "fair",
+        limit: int = 20,
+        user_description: str | None = None,
     ) -> PriceEstimate:
-        """Price an item from its Vision labels, ranked most-confident first.
+        """Price an item from a volunteer's description and its Vision labels.
 
-        Each label is searched on its own — joining them into one query AND's the
-        terms together and matches almost nothing. Generic labels ("gadget") are
-        skipped. The top remaining label is tried first; if it has fewer than
-        _MIN_LISTINGS priced listings, the next labels are tried one at a time and
-        the largest sample wins. Mock pricing is used only when no label is usable,
-        none finds anything, or the API itself fails.
+        Each term is searched on its own — joining them into one query AND's the
+        words together and matches almost nothing. A volunteer's description is
+        tried first, then Vision labels ranked most-confident first, skipping
+        generic ones ("gadget"). A term with fewer than _MIN_LISTINGS priced
+        listings moves on to the next, and if none reaches it the largest sample
+        wins. Mock pricing is used only when there is nothing to search, nothing
+        is found, or the API itself fails.
         """
-        mock_query = " ".join(labels)
+        mock_query = " ".join(filter(None, [user_description, *labels]))
         if self._use_mock:
             return self._mock_estimate(mock_query, condition)
         if not self._has_api_credentials():
             logger.warning("EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not set — cannot query eBay")
             return self._fallback_to_mock(mock_query, condition)
 
-        searchable = specific_labels(labels)
-        if not searchable:
-            logger.warning("All Vision labels are too generic to search: %r", labels)
+        terms = _search_terms(labels, user_description)
+        if not terms:
             return self._fallback_to_mock(mock_query, condition)
-        if searchable[0] != labels[0]:
-            logger.warning("Skipping generic label(s) %r", labels[:labels.index(searchable[0])])
 
-        best: tuple[SampledListing, ...] = ()
-        for label in searchable[:_MAX_LABELS_TO_TRY]:
+        best: tuple[tuple[SampledListing, ...], str, str] | None = None
+        for term, source in terms:
             try:
-                listings = self._search_listings(label, limit)
+                listings = self._search_listings(term, limit)
             except Exception as exc:
-                # Auth, rate-limit and network failures won't be fixed by another label
-                logger.warning("eBay Browse API failed for %r — %s", label, _describe_error(exc))
+                # Auth, rate-limit and network failures won't be fixed by another term
+                logger.warning("eBay Browse API failed for %r — %s", term, _describe_error(exc))
                 return self._fallback_to_mock(mock_query, condition)
             if len(listings) >= _MIN_LISTINGS:
-                return self._build_estimate(listings, condition, limit)
+                return self._searched_estimate(listings, term, source, condition, limit)
             logger.warning(
-                "eBay Browse API found %d priced listing(s) for %r (need %d) — trying next label",
-                len(listings), label, _MIN_LISTINGS,
+                "eBay Browse API found %d priced listing(s) for %r (need %d) — trying next term",
+                len(listings), term, _MIN_LISTINGS,
             )
-            if len(listings) > len(best):
-                best = listings
+            if listings and (best is None or len(listings) > len(best[0])):
+                best = (listings, term, source)
 
-        if best:
-            return self._build_estimate(best, condition, limit)
+        if best is not None:
+            return self._searched_estimate(*best, condition, limit)
         return self._fallback_to_mock(mock_query, condition)
 
     def search_prices(self, query: str, condition: str = "fair", limit: int = 20) -> PriceEstimate:
@@ -233,6 +259,17 @@ class EbayClient:
         if result:
             self._cache_set(query, result)
         return result
+
+    def _searched_estimate(
+        self,
+        listings: tuple[SampledListing, ...],
+        term: str,
+        source: str,
+        condition: str,
+        limit: int,
+    ) -> PriceEstimate:
+        estimate = self._build_estimate(listings, condition, limit)
+        return replace(estimate, search_term=term, search_source=source)
 
     def _build_estimate(
         self, listings: tuple[SampledListing, ...], condition: str, limit: int

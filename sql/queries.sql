@@ -12,6 +12,17 @@
 
 
 -- ===========================================================================
+-- Migrations (see db.init_schema)
+-- ===========================================================================
+
+-- name: applied_migrations
+SELECT version FROM schema_migrations;
+
+-- name: record_migration
+INSERT INTO schema_migrations (version) VALUES (%(version)s);
+
+
+-- ===========================================================================
 -- Write path (one transaction per appraisal — see repository.save_appraisal)
 -- ===========================================================================
 
@@ -23,8 +34,10 @@ VALUES (%(name)s)
 ON DUPLICATE KEY UPDATE category_id = LAST_INSERT_ID(category_id);
 
 -- name: insert_item
-INSERT INTO items (category_id, description, condition_label, condition_multiplier)
-VALUES (%(category_id)s, %(description)s, %(condition_label)s, %(condition_multiplier)s);
+INSERT INTO items (category_id, description, user_description,
+                   condition_label, condition_multiplier)
+VALUES (%(category_id)s, %(description)s, %(user_description)s,
+        %(condition_label)s, %(condition_multiplier)s);
 
 -- name: insert_listing
 -- Run via executemany(); PyMySQL rewrites it into one multi-row INSERT.
@@ -32,8 +45,10 @@ INSERT INTO listings_sampled (item_id, ebay_listing_id, sampled_price)
 VALUES (%(item_id)s, %(ebay_listing_id)s, %(sampled_price)s);
 
 -- name: insert_estimate
-INSERT INTO price_estimates (item_id, market_median, estimated_price, source)
-VALUES (%(item_id)s, %(market_median)s, %(estimated_price)s, %(source)s);
+INSERT INTO price_estimates (item_id, market_median, estimated_price, source,
+                             search_term, search_source)
+VALUES (%(item_id)s, %(market_median)s, %(estimated_price)s, %(source)s,
+        %(search_term)s, %(search_source)s);
 
 
 -- ===========================================================================
@@ -49,11 +64,14 @@ SELECT pe.estimate_id,
        i.item_id,
        c.name              AS category,
        i.description,
+       i.user_description,
        i.condition_label,
        i.condition_multiplier,
        pe.market_median,
        pe.estimated_price,
        pe.source,
+       pe.search_term,
+       pe.search_source,
        pe.created_at,
        ls.sample_size,
        ls.low,
@@ -75,6 +93,7 @@ LIMIT %(limit)s;
 SELECT i.item_id,
        c.name AS category,
        i.description,
+       i.user_description,
        i.condition_label,
        i.condition_multiplier,
        i.created_at
@@ -83,7 +102,8 @@ JOIN categories c ON c.category_id = i.category_id
 WHERE i.item_id = %(item_id)s;
 
 -- name: item_estimates
-SELECT estimate_id, market_median, estimated_price, source, created_at
+SELECT estimate_id, market_median, estimated_price, source,
+       search_term, search_source, created_at
 FROM price_estimates
 WHERE item_id = %(item_id)s
 ORDER BY created_at DESC, estimate_id DESC;

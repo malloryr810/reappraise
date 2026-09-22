@@ -1,4 +1,5 @@
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -122,7 +123,9 @@ def test_condition_param_is_forwarded_to_search():
         with patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE) as mock_search:
             _post(condition="good")
 
-    mock_search.assert_called_once_with(["camera", "electronics"], condition="good")
+    mock_search.assert_called_once_with(
+        ["camera", "electronics"], condition="good", user_description=None,
+    )
 
 
 def test_invalid_condition_returns_422():
@@ -190,6 +193,66 @@ def test_all_generic_labels_fall_back_to_top_label_as_category(monkeypatch):
         _post()
 
     assert mock_save.call_args.kwargs["category"] == "gadget"
+
+
+_SEARCHED_ESTIMATE = replace(
+    _ESTIMATE, is_mock=False, source="browse_api",
+    search_term="Trek Emonda SL 5", search_source="user_description",
+)
+
+
+def _post_description(description, estimate=_SEARCHED_ESTIMATE):
+    with (
+        patch.object(app_module._vision, "identify_item", return_value=_LABELS),
+        patch.object(app_module._ebay, "search_labels", return_value=estimate) as mock_search,
+        patch.object(app_module, "connect", _fake_connect),
+        patch.object(app_module.repository, "save_appraisal", return_value=42) as mock_save,
+    ):
+        resp = client.post(
+            "/appraise",
+            files={"file": ("item.jpg", _FAKE_IMAGE, "image/jpeg")},
+            data={"user_description": description},
+        )
+    return resp, mock_search, mock_save
+
+
+def test_description_is_forwarded_stripped_and_persisted(monkeypatch):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    resp, mock_search, mock_save = _post_description("  Trek Emonda SL 5  ")
+
+    assert resp.status_code == 200
+    assert mock_search.call_args.kwargs["user_description"] == "Trek Emonda SL 5"
+    kwargs = mock_save.call_args.kwargs
+    assert kwargs["user_description"] == "Trek Emonda SL 5"
+    # Vision's output is stored untouched alongside it
+    assert (kwargs["category"], kwargs["description"]) == ("camera", "camera electronics")
+
+
+def test_response_reports_what_was_searched():
+    resp, _, _ = _post_description("Trek Emonda SL 5")
+
+    body = resp.json()
+    assert body["user_description"] == "Trek Emonda SL 5"
+    assert body["search_term"] == "Trek Emonda SL 5"
+    assert body["search_source"] == "user_description"
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_blank_description_is_treated_as_absent(monkeypatch, blank):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    resp, mock_search, mock_save = _post_description(blank, estimate=_ESTIMATE)
+
+    assert resp.status_code == 200
+    assert mock_search.call_args.kwargs["user_description"] is None
+    assert mock_save.call_args.kwargs["user_description"] is None
+    assert resp.json()["user_description"] is None
+
+
+def test_description_longer_than_column_is_rejected():
+    resp, mock_search, _ = _post_description("x" * (app_module.USER_DESCRIPTION_MAX + 1))
+
+    assert resp.status_code == 422
+    mock_search.assert_not_called()
 
 
 def test_persistence_failure_still_returns_appraisal(monkeypatch, caplog):

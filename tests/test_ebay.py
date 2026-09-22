@@ -320,6 +320,98 @@ def test_forced_mock_mode_does_not_log_fallback(monkeypatch, caplog):
 
 
 # ---------------------------------------------------------------------------
+# Volunteer's description — searched first, Vision labels are the fallback
+# ---------------------------------------------------------------------------
+
+LABELS = ["bicycle", "bicycle tire", "wheel"]
+
+
+def test_sufficient_description_is_the_only_search(api_env):
+    post, get, get_mock = _api({"Trek Emonda SL 5": _search_resp(*FIVE)})
+    with post, get:
+        estimate = EbayClient().search_labels(LABELS, user_description="Trek Emonda SL 5")
+
+    assert _queries(get_mock) == ["Trek Emonda SL 5"]  # Vision labels never queried
+    assert (estimate.search_term, estimate.search_source) == (
+        "Trek Emonda SL 5", ebay.SEARCH_SOURCE_USER,
+    )
+    assert estimate.is_mock is False
+
+
+def test_thin_description_falls_back_to_vision_label_broadening(api_env, caplog):
+    post, get, get_mock = _api({
+        "Trek Emonda SL 5": _search_resp(1500.0),
+        "bicycle": _search_resp(*FIVE),
+    })
+    with post, get:
+        estimate = EbayClient().search_labels(LABELS, user_description="Trek Emonda SL 5")
+
+    assert _queries(get_mock) == ["Trek Emonda SL 5", "bicycle"]
+    assert (estimate.search_term, estimate.search_source) == ("bicycle", ebay.SEARCH_SOURCE_VISION)
+    assert estimate.market_median == 30.0
+    assert "'Trek Emonda SL 5'" in caplog.text
+
+
+def test_description_does_not_use_up_the_vision_label_budget(api_env):
+    post, get, get_mock = _api({term: _search_resp() for term in ["my lamp", *LABELS]})
+    with post, get:
+        EbayClient().search_labels(LABELS, user_description="my lamp")
+
+    assert _queries(get_mock) == ["my lamp", *LABELS[:ebay._MAX_LABELS_TO_TRY]]
+
+
+def test_largest_sample_can_come_from_the_description(api_env):
+    post, get, _ = _api({
+        "vintage lamp": _search_resp(10.0, 20.0, 30.0),
+        "lamp": _search_resp(40.0),
+    })
+    with post, get:
+        estimate = EbayClient().search_labels(["lamp"], user_description="vintage lamp")
+
+    assert (estimate.search_term, estimate.search_source, estimate.sample_size) == (
+        "vintage lamp", ebay.SEARCH_SOURCE_USER, 3,
+    )
+
+
+def test_no_description_keeps_vision_only_behaviour(api_env):
+    post, get, get_mock = _api({"bicycle": _search_resp(*FIVE)})
+    with post, get:
+        estimate = EbayClient().search_labels(LABELS)
+
+    assert _queries(get_mock) == ["bicycle"]
+    assert (estimate.search_term, estimate.search_source) == ("bicycle", ebay.SEARCH_SOURCE_VISION)
+
+
+@pytest.mark.parametrize("blank", ["", "   ", None])
+def test_blank_description_is_treated_as_absent(api_env, blank):
+    post, get, get_mock = _api({"bicycle": _search_resp(*FIVE)})
+    with post, get:
+        EbayClient().search_labels(LABELS, user_description=blank)
+
+    assert _queries(get_mock) == ["bicycle"]
+
+
+def test_description_is_searched_even_when_every_vision_label_is_generic(api_env):
+    post, get, get_mock = _api({"KitchenAid stand mixer": _search_resp(*FIVE)})
+    with post, get:
+        estimate = EbayClient().search_labels(
+            ["gadget", "technology"], user_description="KitchenAid stand mixer",
+        )
+
+    assert _queries(get_mock) == ["KitchenAid stand mixer"]
+    assert estimate.is_mock is False
+
+
+def test_mock_estimate_records_no_search_term(api_env):
+    post, get, _ = _api({"xyzzy": _search_resp(), "bicycle": _search_resp()})
+    with post, get:
+        estimate = EbayClient().search_labels(["bicycle"], user_description="xyzzy")
+
+    assert estimate.is_mock is True
+    assert (estimate.search_term, estimate.search_source) == (None, None)
+
+
+# ---------------------------------------------------------------------------
 # Cache behaviour
 # ---------------------------------------------------------------------------
 

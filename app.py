@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pymysql.connections import Connection
@@ -19,6 +19,9 @@ from ebay import CONDITION_MULTIPLIERS, EbayClient, PriceEstimate, specific_labe
 from vision import VisionClient
 
 logger = logging.getLogger("reappraise")
+
+# Matches items.user_description VARCHAR(255); longer input is rejected, not trimmed
+USER_DESCRIPTION_MAX = 255
 
 
 class LabelOut(BaseModel):
@@ -44,6 +47,11 @@ class AppraiseResponse(BaseModel):
     price_estimate: PriceOut
     # None when persistence is disabled or the save failed
     item_id: int | None = None
+    user_description: str | None = None
+    # What eBay was actually searched for: "user_description" or "vision_label";
+    # both None when the price came from the mock catalog
+    search_term: str | None = None
+    search_source: str | None = None
 
 
 class HistoryEntry(BaseModel):
@@ -51,11 +59,14 @@ class HistoryEntry(BaseModel):
     item_id: int
     category: str
     description: str | None
+    user_description: str | None
     condition_label: str | None
     condition_multiplier: float | None
     market_median: float | None
     estimated_price: float | None
     source: str
+    search_term: str | None
+    search_source: str | None
     created_at: datetime
     sample_size: int
     low: float | None
@@ -67,6 +78,8 @@ class EstimateOut(BaseModel):
     market_median: float | None
     estimated_price: float | None
     source: str
+    search_term: str | None
+    search_source: str | None
     created_at: datetime
 
 
@@ -81,6 +94,7 @@ class ItemDetailOut(BaseModel):
     item_id: int
     category: str
     description: str | None
+    user_description: str | None
     condition_label: str | None
     condition_multiplier: float | None
     created_at: datetime
@@ -140,7 +154,9 @@ def _db() -> Iterator[Connection]:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
 
-def _persist(category: str, description: str, estimate: PriceEstimate) -> int | None:
+def _persist(
+    category: str, description: str, user_description: str | None, estimate: PriceEstimate
+) -> int | None:
     """Save an appraisal; returns item_id, or None if disabled or the save failed.
 
     A database outage shouldn't cost the user their price estimate, so failures
@@ -151,7 +167,11 @@ def _persist(category: str, description: str, estimate: PriceEstimate) -> int | 
     try:
         with connect(_db_config) as conn:
             return repository.save_appraisal(
-                conn, category=category, description=description, estimate=estimate
+                conn,
+                category=category,
+                description=description,
+                user_description=user_description,
+                estimate=estimate,
             )
     except Exception:
         logger.exception("Failed to persist appraisal for %r", category)
@@ -162,6 +182,8 @@ def _persist(category: str, description: str, estimate: PriceEstimate) -> int | 
 async def appraise(
     file: UploadFile = File(...),
     condition: str = Query(default="fair"),
+    # Optional brand/model/specifics from a volunteer; searched before Vision's labels
+    user_description: str | None = Form(default=None, max_length=USER_DESCRIPTION_MAX),
 ) -> AppraiseResponse:
     if condition not in CONDITION_MULTIPLIERS:
         raise HTTPException(
@@ -171,6 +193,8 @@ async def appraise(
 
     if not (file.content_type or "").startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image")
+
+    manual_description = (user_description or "").strip() or None
 
     image_bytes = await file.read()
     if not image_bytes:
@@ -194,7 +218,9 @@ async def appraise(
     item_name = next(iter(specific_labels(label_names)), label_names[0])
 
     try:
-        estimate = _ebay.search_labels(label_names, condition=condition)
+        estimate = _ebay.search_labels(
+            label_names, condition=condition, user_description=manual_description
+        )
     except Exception as exc:
         logger.exception("eBay price lookup failed")
         raise HTTPException(status_code=502, detail="eBay API error") from exc
@@ -205,7 +231,12 @@ async def appraise(
             detail=f"No eBay listings found for '{item_name}' — try a clearer photo",
         )
 
-    item_id = _persist(category=item_name, description=description, estimate=estimate)
+    item_id = _persist(
+        category=item_name,
+        description=description,
+        user_description=manual_description,
+        estimate=estimate,
+    )
 
     return AppraiseResponse(
         item=item_name,
@@ -222,6 +253,9 @@ async def appraise(
             multiplier_used=estimate.multiplier_used,
         ),
         item_id=item_id,
+        user_description=manual_description,
+        search_term=estimate.search_term,
+        search_source=estimate.search_source,
     )
 
 

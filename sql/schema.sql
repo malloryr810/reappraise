@@ -5,7 +5,12 @@
 -- without re-hitting eBay. An item can therefore have several estimates over
 -- time; read queries pick the latest one per item.
 --
--- Idempotent: safe to run repeatedly (`python db.py init`).
+-- This file is the baseline schema. Later changes are numbered files in
+-- sql/migrations/, applied in order and recorded in schema_migrations, so an
+-- existing database with real data is upgraded in place rather than recreated.
+--
+-- Idempotent: `python db.py init` creates any missing tables, then applies any
+-- migrations not yet recorded. Safe to run repeatedly.
 
 CREATE TABLE IF NOT EXISTS categories (
     category_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -48,4 +53,9 @@ CREATE TABLE IF NOT EXISTS price_estimates (
     FOREIGN KEY (item_id) REFERENCES items(item_id) ON DELETE CASCADE,
     INDEX idx_estimates_created_at (created_at),
     CHECK (source IN ('browse_api', 'sold_scrape', 'mock'))
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version    VARCHAR(100) PRIMARY KEY,  -- migration file name without .sql
+    applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
