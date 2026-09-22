@@ -22,6 +22,7 @@ _SQL_DIR = Path(__file__).parent / "sql"
 _MIGRATIONS_DIR = _SQL_DIR / "migrations"
 _NAME_HEADER = re.compile(r"^--\s*name:\s*(\w+)\s*$", re.MULTILINE)
 _COMMENT_LINE = re.compile(r"^\s*--.*$", re.MULTILINE)
+_MIGRATION_NAME = re.compile(r"^\d{3}_\w+\.sql$")
 _CONNECT_TIMEOUT_S = 5
 
 
@@ -109,8 +110,16 @@ def schema_statements() -> list[str]:
 
 
 def migration_files() -> list[tuple[str, Path]]:
-    """(version, path) for every sql/migrations/NNN_*.sql file, oldest first."""
-    return [(path.stem, path) for path in sorted(_MIGRATIONS_DIR.glob("[0-9][0-9][0-9]_*.sql"))]
+    """(version, path) for every sql/migrations/NNN_*.sql file, oldest first.
+
+    A .sql file that doesn't follow the NNN_name.sql pattern raises instead of
+    being skipped — a silently ignored migration would leave the schema behind.
+    """
+    paths = sorted(_MIGRATIONS_DIR.glob("*.sql"))
+    misnamed = [path.name for path in paths if not _MIGRATION_NAME.match(path.name)]
+    if misnamed:
+        raise ValueError(f"Migration files must be named NNN_description.sql: {misnamed}")
+    return [(path.stem, path) for path in paths]
 
 
 def applied_migrations(conn: Connection) -> set[str]:

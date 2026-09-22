@@ -187,7 +187,7 @@ Example response (illustrative values):
 }
 ```
 
-`estimated_resale_value` = `market_median × multiplier_used`. `is_mock: false` confirms prices came from real eBay listings. `search_source` says whether the volunteer's description or a Vision label set the price; if the description found fewer than 5 listings it will be `vision_label`.
+`estimated_resale_value` = `market_median × multiplier_used`. `is_mock: false` confirms prices came from real eBay listings. `search_source` says whether the volunteer's description or a Vision label set the price. If the description finds fewer than 5 listings, the Vision labels are tried next and the price comes from the first search that reaches 5, or from whichever found the most listings if none does.
 
 ## Running the tests
 
@@ -196,7 +196,7 @@ pytest                   # everything
 pytest -m "not integration"   # skip the MySQL tests
 ```
 
-104 tests. The unit tests mock every external call. The 27 integration tests in `tests/test_db_integration.py` run against a real MySQL database (`MYSQL_TEST_DATABASE`, truncated before each test). They cover schema migrations (including upgrading a database that predates them), the transactional write path and rollback, each read and analytics query, SQL-computed medians checked against Python's `statistics.median`, recompute, and a full `/appraise` → `/history` round trip. They are skipped automatically when MySQL isn't configured.
+108 tests. The unit tests mock every external call. The 27 integration tests in `tests/test_db_integration.py` run against a real MySQL database (`MYSQL_TEST_DATABASE`, truncated before each test). They cover schema migrations (including upgrading a database that predates them), the transactional write path and rollback, each read and analytics query, SQL-computed medians checked against Python's `statistics.median`, recompute, and a full `/appraise` → `/history` round trip. They are skipped automatically when MySQL isn't configured.
 
 ## Tech stack
 

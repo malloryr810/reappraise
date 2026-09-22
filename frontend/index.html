@@ -770,11 +770,15 @@
     vision_label: 'photo label',
   };
 
-  // Which input set the price. Flags a description that was given but found too few listings.
+  // Which input set the price. Flags a description that was searched but lost out to a
+  // photo label; a mock price already carries its own "estimated" badge.
   function searchNote(row) {
     const note = SEARCH_SOURCE_LABELS[row.search_source] ?? '';
-    const descriptionUnused = row.user_description && row.search_source !== 'user_description';
-    return descriptionUnused ? 'description had too few matches' : note;
+    return descriptionFellBack(row) ? 'description had too few matches' : note;
+  }
+
+  function descriptionFellBack(row) {
+    return Boolean(row.user_description) && row.search_source === 'vision_label';
   }
 
   // ── Helpers ───────────────────────────────────────────────────
@@ -820,7 +824,7 @@
     const parts = [cond, shortDate.format(new Date(row.created_at))];
     if (row.source === 'mock') parts.push('estimated');
     if (row.search_source === 'user_description') parts.push('priced from your description');
-    else if (row.user_description) parts.push('description had too few matches');
+    else if (descriptionFellBack(row)) parts.push('description had too few matches');
     meta.textContent = parts.filter(Boolean).join(' · ');
     label.append(meta);
 
