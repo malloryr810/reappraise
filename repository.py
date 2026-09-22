@@ -142,12 +142,8 @@ def avg_price_by_category(conn: Connection) -> list[Row]:
     return _fetch_all(conn, "avg_price_by_category")
 
 
-def below_category_market(
-    conn: Connection, ratio: float = 0.5, min_peers: int = 3, limit: int = 50
-) -> list[Row]:
-    return _fetch_all(
-        conn, "below_category_market", ratio=ratio, min_peers=min_peers, limit=limit
-    )
+def price_range_by_category(conn: Connection, limit: int = 50) -> list[Row]:
+    return _fetch_all(conn, "price_range_by_category", limit=limit)
 
 
 def top_category_by_volume(conn: Connection) -> list[Row]:

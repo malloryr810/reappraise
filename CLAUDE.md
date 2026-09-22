@@ -1,50 +1,37 @@
-# Item Appraisal Tool — ReStore Pricing Assistant
+# ReAppraise
 
-## What this project does
-User photographs a donated item → Google Vision identifies it → Playwright scrapes eBay's sold/completed listings for market prices → applies a condition multiplier to estimate fair resale price for a Habitat for Humanity ReStore.
+Photo → price tool for Habitat for Humanity ReStore volunteers. Google Vision labels the item, the eBay Browse API finds a market median, and a condition multiplier (fair = 0.6, the ReStore's 60% policy) turns it into a resale price. Every appraisal is saved to MySQL for history and analytics. See README.md for the full architecture and schema.
 
-## Motivation
-Built to automate the manual price lookup process used at a Habitat for Humanity ReStore. Staff would look up donated items and price them at roughly 60% of market value. This tool does that automatically from a photo.
-
-## Pricing logic
-Condition multiplier replaces the flat rate (not stacked on top):
-- terrible: 0.4 / poor: 0.5 / fair: 0.6 / good: 0.7 / like_new: 0.8
-- "fair" is the default and matches the ReStore's standard pricing policy
-
-## Project structure
-- `vision.py` — Google Vision REST API, plain API key, LABEL_DETECTION + OBJECT_LOCALIZATION
-- `ebay.py` — Playwright-based eBay scraper (completed/sold listings), 2-hour in-memory cache, persistent browser instance, mock fallback
-- `app.py` — FastAPI, POST /appraise (condition validated against CONDITION_MULTIPLIERS), GET /history, /history/{item_id}, /analytics/*
-- `db.py` — MySQL config from env, transactional `connect()`, named-query loader, `python db.py init`
-- `repository.py` — save_appraisal (one transaction), history reads, recompute_estimate, analytics
-- `sql/schema.sql` — categories → items → listings_sampled / price_estimates
-- `sql/queries.sql` — every SQL statement, as `-- name: <id>` blocks (single source of truth)
-- `frontend/index.html` — upload form, results, Recent Appraisals card (GET /history)
-
-## eBay scraper details
-The eBay Developer API was blocked (developer account rejected twice). Instead, the scraper uses Playwright (headless Chromium) to load eBay's completed/sold listing pages directly — this bypasses the Akamai JavaScript browser challenge that blocks plain HTTP clients even with correct TLS fingerprints.
-
-Two performance optimisations are active:
-- **In-memory cache**: results keyed by normalised query string, 2-hour TTL. Cache stores raw price lists so any condition's multiplier can be applied without re-scraping.
-- **Persistent browser**: one Chromium instance shared across all requests. Initialised lazily on first scrape call, re-launched automatically if disconnected.
-
-CSS selector: `span.s-card__price` (eBay's current markup). Strikethrough prices (crossed-out asking prices on Best-Offer-accepted listings) are skipped because the actual accepted amount is not disclosed.
-
-## Environment variables needed
-- `GOOGLE_VISION_API_KEY` — plain API key from GCP console
-- `EBAY_MOCK=true` — optional; forces mock catalog, bypasses scraper entirely
-- `EBAY_CLIENT_ID` / `EBAY_CLIENT_SECRET` — Browse API (tried before the scraper when set)
-- `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` — persistence; unset MYSQL_DATABASE disables it
-- `MYSQL_TEST_DATABASE` — integration tests (truncated per test; must differ from MYSQL_DATABASE)
+## Running it
+- Use `venv/` only. `.venv/` was a stale duplicate and has been deleted; don't recreate it.
+- Server: `venv/bin/uvicorn app:app --reload --reload-dir . --reload-exclude 'venv/*'` (binds 127.0.0.1:8000)
+- Before testing, check `lsof -nP -iTCP:8000 -sTCP:LISTEN` shows one server. A stale server bound to `*:8000` was found and removed on 2026-09-21. Two PIDs sharing one socket is normal (uvicorn reloader + worker).
+- Tests: `venv/bin/python -m pytest -q`. There are 81 tests: 22 app, 34 ebay, 6 vision, 19 MySQL integration. Integration tests **skip** when MySQL is down, so "all passed" only covers the DB if 0 were skipped.
+- Fallback warnings (eBay errors, skipped labels, mock pricing) print to the uvicorn console. Check it after every upload.
 
 ## Persistence
-- Local MySQL via Homebrew (`brew services start mysql`), app user `reappraise`
-- Analytics exclude `source = 'mock'` rows and use the latest estimate per item (ROW_NUMBER)
-- DB failure during /appraise is logged and the appraisal is still returned (item_id = null)
-- Run `pytest -m "not integration"` to skip MySQL-backed tests
+- Local MySQL via Homebrew (`brew services start mysql`), app user `reappraise`; credentials in `.env`
+- `MYSQL_TEST_DATABASE` is truncated before every integration test — never point it at the dev database (`MYSQL_DATABASE`)
+- All SQL lives in `sql/queries.sql` as `-- name:` blocks and is loaded by name. Don't write SQL strings in Python.
+- Deleting an item cascades to `listings_sampled` and `price_estimates`. Categories do **not** cascade: an empty category stays until it's deleted by hand.
+- Analytics exclude `source = 'mock'` rows and use each item's latest estimate (`ROW_NUMBER()`).
 
-## Current status
-- 70/70 tests passing (18 are MySQL integration tests, skipped without MYSQL_TEST_DATABASE)
-- MySQL persistence live; verified end to end with real eBay Browse API data
-- Frontend built, including Recent Appraisals history card
-- Google Vision key was returning 403 Forbidden as of 2026-09-21 (key/project issue, not code)
+## eBay pricing (ebay.py) — decisions to keep
+- **Browse API only → mock fallback.** The Playwright scraper was removed on 2026-09-21: it bypassed eBay's bot detection, which likely breaks eBay's terms of service. It had been added in May when API access was denied, and it's no longer needed. Don't re-add scraping.
+- Mock prices must stay visible: `is_mock=True`, `source='mock'`, the frontend badge, and a WARNING log saying why. Never fall back silently.
+- `search_labels()` searches **one label at a time**, never the labels joined into one query (joined labels AND together and match almost nothing). Order: skip generic labels → top remaining label → if fewer than 5 priced listings, try the next labels (at most 3) → use the largest real sample → mock only when nothing is found or the API errors.
+- Generic-label denylist (`_GENERIC_LABEL_WORDS`) matches whole words inside a label. The stored category is the first specific label (`specific_labels()` in app.py).
+
+## Known limitations (documented in README, not bugs)
+- Estimates are only as specific as the label: a $1,600 bike is priced against generic "bicycle" listings.
+- The denylist is a starter list. Material/colour-only labels still get through ("plastic" priced a wallet at a $12.62 median). The planned fix is to filter by kind of label rather than extend the word list.
+- Similar labels aren't merged: "bicycle" and "road bicycle" are separate categories.
+- Browse API returns active asking prices, not sold prices.
+
+## Next up
+- Manual text-box override so staff can type the item name when Vision's label is wrong (deliberately left out so far).
+
+## Working agreements
+- The owner writes all commit messages. Never commit unless explicitly asked.
+- Verify with raw data (MySQL rows, server logs), not just HTTP 200s. Show actual rows when reporting.
+- Tests first for behaviour changes; keep the per-file test count accurate when reporting.

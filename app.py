@@ -15,7 +15,7 @@ from pymysql.connections import Connection
 
 import repository
 from db import DbConfig, connect
-from ebay import CONDITION_MULTIPLIERS, EbayClient, PriceEstimate
+from ebay import CONDITION_MULTIPLIERS, EbayClient, PriceEstimate, specific_labels
 from vision import VisionClient
 
 logger = logging.getLogger("reappraise")
@@ -95,15 +95,15 @@ class CategoryStat(BaseModel):
     avg_market_median: float | None
 
 
-class BelowMarketItem(BaseModel):
-    item_id: int
+class CategoryPriceRange(BaseModel):
     category: str
-    description: str | None
-    condition_label: str | None
-    market_median: float | None
-    estimated_price: float | None
-    category_avg_median: float | None
-    ratio_to_category: float | None
+    item_count: int
+    listing_count: int
+    low_price: float
+    high_price: float
+    price_range: float
+    high_to_low_ratio: float | None
+    range_rank: int
 
 
 class CategoryVolume(BaseModel):
@@ -186,10 +186,15 @@ async def appraise(
     if not labels:
         raise HTTPException(status_code=422, detail="No items detected in image")
 
-    query = " ".join(label.name for label in labels[:3])
+    # Labels arrive ranked by confidence; the eBay client searches them one at a time
+    label_names = [label.name for label in labels]
+    description = " ".join(label_names[:3])
+    # Name the item by its first specific label, so a generic top label like
+    # "gadget" doesn't become the stored category; fall back if all are generic
+    item_name = next(iter(specific_labels(label_names)), label_names[0])
 
     try:
-        estimate = _ebay.search_prices(query, condition=condition)
+        estimate = _ebay.search_labels(label_names, condition=condition)
     except Exception as exc:
         logger.exception("eBay price lookup failed")
         raise HTTPException(status_code=502, detail="eBay API error") from exc
@@ -197,13 +202,13 @@ async def appraise(
     if estimate.sample_size == 0:
         raise HTTPException(
             status_code=422,
-            detail=f"No eBay listings found for '{labels[0].name}' — try a clearer photo",
+            detail=f"No eBay listings found for '{item_name}' — try a clearer photo",
         )
 
-    item_id = _persist(category=labels[0].name, description=query, estimate=estimate)
+    item_id = _persist(category=item_name, description=description, estimate=estimate)
 
     return AppraiseResponse(
-        item=labels[0].name,
+        item=item_name,
         labels=[LabelOut(name=lbl.name, confidence=lbl.confidence) for lbl in labels[:5]],
         price_estimate=PriceOut(
             low=estimate.low,
@@ -241,16 +246,10 @@ def analytics_categories() -> list[dict]:
         return repository.avg_price_by_category(conn)
 
 
-@app.get("/analytics/below-market", response_model=list[BelowMarketItem])
-def analytics_below_market(
-    ratio: float = Query(default=0.5, gt=0, le=1),
-    min_peers: int = Query(default=3, ge=2),
-    limit: int = Query(default=50, ge=1, le=200),
-) -> list[dict]:
+@app.get("/analytics/price-range", response_model=list[CategoryPriceRange])
+def analytics_price_range(limit: int = Query(default=50, ge=1, le=200)) -> list[dict]:
     with _db() as conn:
-        return repository.below_category_market(
-            conn, ratio=ratio, min_peers=min_peers, limit=limit
-        )
+        return repository.price_range_by_category(conn, limit=limit)
 
 
 @app.get("/analytics/top-category", response_model=list[CategoryVolume])

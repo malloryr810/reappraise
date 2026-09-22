@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 import app as app_module
 import repository
 from db import DbConfig, connect, init_schema
-from ebay import SOURCE_BROWSE_API, SOURCE_MOCK, SOURCE_SOLD_SCRAPE, PriceEstimate, SampledListing
+from ebay import SOURCE_BROWSE_API, SOURCE_MOCK, PriceEstimate, SampledListing
 from vision import ItemLabel
 
 pytestmark = pytest.mark.integration
@@ -55,7 +55,7 @@ def _estimate(
     *,
     condition: str = "fair",
     multiplier: float = 0.6,
-    source: str = SOURCE_SOLD_SCRAPE,
+    source: str = SOURCE_BROWSE_API,
     ids: list[str | None] | None = None,
 ) -> PriceEstimate:
     ids = ids or [f"ebay-{i}" for i in range(len(prices))]
@@ -105,7 +105,7 @@ def test_save_appraisal_writes_all_four_tables(db_config):
     [estimate] = detail.estimates
     assert estimate["market_median"] == Decimal("20.00")
     assert estimate["estimated_price"] == Decimal("14.00")
-    assert estimate["source"] == SOURCE_SOLD_SCRAPE
+    assert estimate["source"] == SOURCE_BROWSE_API
 
 
 def test_category_is_reused_across_appraisals(db_config):
@@ -211,7 +211,7 @@ def test_recompute_adds_new_estimate_with_override_multiplier(db_config):
     assert len(detail.estimates) == 2
     assert detail.estimates[0]["estimated_price"] == Decimal("15.00")  # newest first
     assert detail.estimates[1]["estimated_price"] == Decimal("12.00")
-    assert detail.estimates[0]["source"] == SOURCE_SOLD_SCRAPE
+    assert detail.estimates[0]["source"] == SOURCE_BROWSE_API
 
 
 def test_recompute_returns_none_without_stored_listings(db_config):
@@ -245,19 +245,40 @@ def test_avg_price_by_category_excludes_mock_and_uses_latest_estimate(db_config)
     assert lamp["avg_market_median"] == Decimal("15.00")
 
 
-def test_below_category_market_flags_items_under_ratio(db_config):
-    for price in (100.0, 110.0, 90.0):
-        _save(db_config, "camera", [price])
-    cheap = _save(db_config, "camera", [20.0])  # category avg = 80 → ratio 0.25
-    _save(db_config, "lamp", [10.0])            # only one lamp — below min_peers
-    _save(db_config, "camera", [1.0], source=SOURCE_MOCK)  # excluded
+def test_price_range_by_category_ranks_widest_spread_first(db_config):
+    _save(db_config, "bicycle", [106.0, 470.0, 2500.0])
+    _save(db_config, "bicycle", [200.0, 300.0])       # second item widens nothing
+    _save(db_config, "wallet", [1.69, 12.62, 149.99])
+    _save(db_config, "lamp", [10.0])                  # single listing — range 0
+    _save(db_config, "toy", [999.0], source=SOURCE_MOCK)  # mock stores no listings
 
     with connect(db_config) as conn:
-        rows = repository.below_category_market(conn, ratio=0.5, min_peers=3)
+        rows = repository.price_range_by_category(conn, limit=10)
 
-    assert [r["item_id"] for r in rows] == [cheap]
-    assert rows[0]["category_avg_median"] == Decimal("80.00")
-    assert rows[0]["ratio_to_category"] == Decimal("0.25")
+    assert [r["category"] for r in rows] == ["bicycle", "wallet", "lamp"]
+    bicycle, wallet, lamp = rows
+    assert (bicycle["item_count"], bicycle["listing_count"]) == (2, 5)
+    assert (bicycle["low_price"], bicycle["high_price"]) == (Decimal("106.00"), Decimal("2500.00"))
+    assert bicycle["price_range"] == Decimal("2394.00")
+    assert bicycle["high_to_low_ratio"] == Decimal("23.58")
+    assert wallet["high_to_low_ratio"] == Decimal("88.75")
+    assert [r["range_rank"] for r in rows] == [1, 2, 3]
+    assert lamp["price_range"] == Decimal("0.00")
+
+
+def test_price_range_by_category_returns_ties_and_respects_limit(db_config):
+    _save(db_config, "lamp", [10.0, 20.0])
+    _save(db_config, "drill", [50.0, 60.0])
+    _save(db_config, "toy", [1.0, 2.0])
+
+    with connect(db_config) as conn:
+        tied = repository.price_range_by_category(conn, limit=10)
+        limited = repository.price_range_by_category(conn, limit=1)
+
+    assert [(r["category"], r["range_rank"]) for r in tied] == [
+        ("drill", 1), ("lamp", 1), ("toy", 3),
+    ]
+    assert len(limited) == 1
 
 
 def test_top_category_by_volume_returns_all_ties(db_config):
@@ -282,7 +303,7 @@ def test_appraise_persists_and_history_reads_it_back(db_config, monkeypatch):
     with (
         patch.object(app_module._vision, "identify_item",
                      return_value=[ItemLabel("camera", 0.95), ItemLabel("lens", 0.8)]),
-        patch.object(app_module._ebay, "search_prices", return_value=estimate),
+        patch.object(app_module._ebay, "search_labels", return_value=estimate),
     ):
         resp = client.post("/appraise", files={"file": ("x.jpg", b"\xff\xd8\xff", "image/jpeg")})
 
@@ -303,4 +324,5 @@ def test_appraise_persists_and_history_reads_it_back(db_config, monkeypatch):
 
     assert client.get("/analytics/categories").json()[0]["category"] == "camera"
     assert client.get("/analytics/top-category").json() == [{"category": "camera", "item_count": 1}]
-    assert client.get("/analytics/below-market").json() == []
+    [price_range] = client.get("/analytics/price-range").json()
+    assert (price_range["category"], price_range["price_range"]) == ("camera", 310.0)

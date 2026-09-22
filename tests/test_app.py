@@ -22,7 +22,7 @@ _ESTIMATE = PriceEstimate(
 _EMPTY_ESTIMATE = PriceEstimate(
     low=0.0, market_median=0.0, estimated_resale_value=0.0,
     high=0.0, currency="USD", sample_size=0, is_mock=False,
-    condition="fair", multiplier_used=0.6, source="sold_scrape",
+    condition="fair", multiplier_used=0.6, source="browse_api",
 )
 _FAKE_DB = DbConfig(host="h", port=1, user="u", password="p", database="d")
 
@@ -54,7 +54,7 @@ def _post(image_bytes=_FAKE_IMAGE, content_type="image/jpeg", condition=None):
 def test_happy_path_returns_full_response():
     with (
         patch.object(app_module._vision, "identify_item", return_value=_LABELS),
-        patch.object(app_module._ebay, "search_prices", return_value=_ESTIMATE),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE),
     ):
         resp = _post()
 
@@ -89,7 +89,7 @@ def test_no_labels_detected_returns_422():
 def test_no_price_data_returns_422():
     with (
         patch.object(app_module._vision, "identify_item", return_value=_LABELS),
-        patch.object(app_module._ebay, "search_prices", return_value=_EMPTY_ESTIMATE),
+        patch.object(app_module._ebay, "search_labels", return_value=_EMPTY_ESTIMATE),
     ):
         resp = _post()
 
@@ -119,10 +119,10 @@ def test_missing_file_returns_422():
 
 def test_condition_param_is_forwarded_to_search():
     with patch.object(app_module._vision, "identify_item", return_value=_LABELS):
-        with patch.object(app_module._ebay, "search_prices", return_value=_ESTIMATE) as mock_search:
+        with patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE) as mock_search:
             _post(condition="good")
 
-    mock_search.assert_called_once_with("camera electronics", condition="good")
+    mock_search.assert_called_once_with(["camera", "electronics"], condition="good")
 
 
 def test_invalid_condition_returns_422():
@@ -135,7 +135,7 @@ def test_invalid_condition_returns_422():
 def test_item_id_is_none_when_persistence_disabled():
     with (
         patch.object(app_module._vision, "identify_item", return_value=_LABELS),
-        patch.object(app_module._ebay, "search_prices", return_value=_ESTIMATE),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE),
     ):
         resp = _post()
 
@@ -147,7 +147,7 @@ def test_appraisal_is_persisted_when_database_configured(monkeypatch):
     monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
     with (
         patch.object(app_module._vision, "identify_item", return_value=_LABELS),
-        patch.object(app_module._ebay, "search_prices", return_value=_ESTIMATE),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE),
         patch.object(app_module, "connect", _fake_connect),
         patch.object(app_module.repository, "save_appraisal", return_value=42) as mock_save,
     ):
@@ -161,11 +161,42 @@ def test_appraisal_is_persisted_when_database_configured(monkeypatch):
     assert kwargs["estimate"] is _ESTIMATE
 
 
+def test_generic_top_label_is_not_used_as_category(monkeypatch):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    labels = [ItemLabel("gadget", 0.9), ItemLabel("game controller", 0.85)]
+    with (
+        patch.object(app_module._vision, "identify_item", return_value=labels),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE),
+        patch.object(app_module, "connect", _fake_connect),
+        patch.object(app_module.repository, "save_appraisal", return_value=42) as mock_save,
+    ):
+        resp = _post()
+
+    assert resp.json()["item"] == "game controller"
+    assert mock_save.call_args.kwargs["category"] == "game controller"
+    # Description keeps Vision's raw labels as a record of what was seen
+    assert mock_save.call_args.kwargs["description"] == "gadget game controller"
+
+
+def test_all_generic_labels_fall_back_to_top_label_as_category(monkeypatch):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    with (
+        patch.object(app_module._vision, "identify_item",
+                     return_value=[ItemLabel("gadget", 0.9), ItemLabel("technology", 0.8)]),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE),
+        patch.object(app_module, "connect", _fake_connect),
+        patch.object(app_module.repository, "save_appraisal", return_value=42) as mock_save,
+    ):
+        _post()
+
+    assert mock_save.call_args.kwargs["category"] == "gadget"
+
+
 def test_persistence_failure_still_returns_appraisal(monkeypatch, caplog):
     monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
     with (
         patch.object(app_module._vision, "identify_item", return_value=_LABELS),
-        patch.object(app_module._ebay, "search_prices", return_value=_ESTIMATE),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE),
         patch.object(app_module, "connect", _fake_connect),
         patch.object(
             app_module.repository, "save_appraisal", side_effect=RuntimeError("db down")
@@ -183,7 +214,7 @@ def test_persistence_failure_still_returns_appraisal(monkeypatch, caplog):
     "/history",
     "/history/1",
     "/analytics/categories",
-    "/analytics/below-market",
+    "/analytics/price-range",
     "/analytics/top-category",
 ])
 def test_read_endpoints_return_503_without_database(path):

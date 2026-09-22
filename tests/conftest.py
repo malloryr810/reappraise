@@ -7,9 +7,9 @@ def _clear_ebay_browse_api_credentials(monkeypatch):
 
     test_app.py imports app.py at module level, which calls load_dotenv() and
     sets EBAY_CLIENT_ID / EBAY_CLIENT_SECRET for the entire pytest process.
-    Tests that mock the Playwright scraper path depend on _has_api_credentials()
-    returning False so the Browse API path is not taken. This fixture ensures
-    that isolation regardless of test ordering.
+    Without this, any test that doesn't patch httpx would call the real eBay API
+    with those credentials. Clearing them sends such tests to the mock fallback
+    instead, regardless of test ordering.
 
     Tests that need Browse API credentials can override via monkeypatch.setenv().
     """

@@ -141,47 +141,37 @@ WHERE le.rn = 1
 GROUP BY c.category_id, c.name
 ORDER BY avg_estimated_price DESC, category;
 
--- name: below_category_market
--- Items whose market median is well below their category's average median —
--- e.g. ratio = 0.5 flags items trading at under half the category norm.
--- (Comparing estimated_price to its own market_median would be meaningless:
--- estimated = median x condition multiplier, so it's always 40-80% by design.)
--- The window AVG() computes the category baseline without a self-join.
-WITH latest AS (
-    SELECT pe.item_id,
-           pe.market_median,
-           pe.estimated_price,
-           ROW_NUMBER() OVER (PARTITION BY pe.item_id
-                              ORDER BY pe.created_at DESC, pe.estimate_id DESC) AS rn
-    FROM price_estimates pe
-    WHERE pe.source <> 'mock'
-),
-scored AS (
-    SELECT i.item_id,
-           c.name AS category,
-           i.description,
-           i.condition_label,
-           le.market_median,
-           le.estimated_price,
-           AVG(le.market_median) OVER (PARTITION BY i.category_id) AS category_avg_median,
-           COUNT(*)              OVER (PARTITION BY i.category_id) AS category_items
-    FROM latest le
-    JOIN items i      ON i.item_id = le.item_id
+-- name: price_range_by_category
+-- Categories with the widest spread between their cheapest and most expensive
+-- sampled eBay listing. Search uses one label per item, so items in the same
+-- category usually share a median; the listings behind each median are what
+-- actually vary, and a wide spread marks categories where the median alone is
+-- a weak guide (a $106 kids' bike and a $2,500 road bike are both "bicycle").
+-- Mock-priced items store no listings, so they drop out of the join.
+-- high_to_low_ratio makes cheap and expensive categories comparable; RANK()
+-- keeps every category tied at a given range.
+WITH spread AS (
+    SELECT c.name                                         AS category,
+           COUNT(DISTINCT i.item_id)                      AS item_count,
+           COUNT(*)                                       AS listing_count,
+           MIN(ls.sampled_price)                          AS low_price,
+           MAX(ls.sampled_price)                          AS high_price,
+           MAX(ls.sampled_price) - MIN(ls.sampled_price)  AS price_range
+    FROM listings_sampled ls
+    JOIN items i      ON i.item_id = ls.item_id
     JOIN categories c ON c.category_id = i.category_id
-    WHERE le.rn = 1
+    GROUP BY c.category_id, c.name
 )
-SELECT item_id,
-       category,
-       description,
-       condition_label,
-       market_median,
-       estimated_price,
-       ROUND(category_avg_median, 2)                                   AS category_avg_median,
-       ROUND(market_median / NULLIF(category_avg_median, 0), 2)        AS ratio_to_category
-FROM scored
-WHERE category_items >= %(min_peers)s
-  AND market_median < %(ratio)s * category_avg_median
-ORDER BY ratio_to_category, item_id
+SELECT category,
+       item_count,
+       listing_count,
+       low_price,
+       high_price,
+       price_range,
+       ROUND(high_price / NULLIF(low_price, 0), 2)        AS high_to_low_ratio,
+       RANK() OVER (ORDER BY price_range DESC)            AS range_rank
+FROM spread
+ORDER BY range_rank, category
 LIMIT %(limit)s;
 
 -- name: top_category_by_volume

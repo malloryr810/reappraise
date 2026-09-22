@@ -1,32 +1,70 @@
 # Reappraise was built to automate the manual price lookup process at a Habitat for
 # Humanity ReStore, where staff price donated goods at roughly 60% of market value.
-# This module scrapes eBay completed/sold listings to find that market value and
-# applies the condition-based discount.
-#
-# eBay runs a JavaScript browser challenge (Akamai) that blocks plain HTTP clients
-# even with correct TLS fingerprints. Playwright executes the challenge the same way
-# a real Chrome browser does, so it gets through to the actual search results.
+# This module looks up that market value with eBay's official Browse API and applies
+# the condition-based discount. When the API can't price an item, it falls back to a
+# clearly-labelled mock catalog (is_mock=True, source="mock") — never to scraping.
 
 import base64
+import logging
 import os
-import random
 import re
 import statistics
 import time
 from dataclasses import dataclass
-from urllib.parse import urlencode
 
 import httpx
-from bs4 import BeautifulSoup, Tag
-from playwright.sync_api import Browser, Playwright, sync_playwright
 
 
 # Values for PriceEstimate.source — persisted to price_estimates.source.
-# The Browse API only returns active listings (asking prices), while the scraper
-# reads completed/sold listings, so the two are kept distinguishable in storage.
+# The Browse API returns active listings (asking prices). "sold_scrape" is still
+# accepted by the schema for historical rows but is no longer produced.
 SOURCE_BROWSE_API = "browse_api"
-SOURCE_SOLD_SCRAPE = "sold_scrape"
 SOURCE_MOCK = "mock"
+
+logger = logging.getLogger("reappraise.ebay")
+
+_TOKEN_URL = "https://api.ebay.com/identity/v1/oauth2/token"
+_SEARCH_URL = "https://api.ebay.com/buy/browse/v1/item_summary/search"
+_API_SCOPE = "https://api.ebay.com/oauth/api_scope"
+_HTTP_TIMEOUT_S = 10.0
+
+# eBay error bodies explain the failure (invalid_client, rate limit, bad query)
+# and are short; cap them so an HTML error page can't flood the log
+_ERROR_BODY_MAX_CHARS = 300
+
+# A median of fewer listings than this is too noisy to trust, so the next
+# Vision label is tried before settling for it
+_MIN_LISTINGS = 5
+# Each label costs one API call, and lower-confidence labels describe the item
+# less reliably, so broadening stops after the top few usable labels
+_MAX_LABELS_TO_TRY = 3
+
+# Vision often ranks a catch-all label first ("Gadget" for a game controller).
+# Searched alone, such a term prices the item against every cheap gadget on eBay,
+# so any label containing one of these words is never used as a search query.
+_GENERIC_LABEL_WORDS = frozenset({
+    "gadget", "technology", "product", "object", "item", "equipment", "supplies",
+})
+_WORD = re.compile(r"[a-z]+")
+
+_CACHE_TTL = 2 * 3600  # 2 hours in seconds
+_TOKEN_REFRESH_BUFFER_S = 60
+
+
+def _describe_error(exc: Exception) -> str:
+    """One-line failure description, including eBay's response body for HTTP errors."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        body = exc.response.text[:_ERROR_BODY_MAX_CHARS]
+        return f"HTTP {exc.response.status_code}: {body}"
+    return f"{type(exc).__name__}: {exc}"
+
+
+def specific_labels(labels: list[str]) -> list[str]:
+    """Labels specific enough to price an item, in their original (confidence) order."""
+    return [
+        label for label in labels
+        if _GENERIC_LABEL_WORDS.isdisjoint(_WORD.findall(label.lower()))
+    ]
 
 
 @dataclass(frozen=True)
@@ -49,12 +87,6 @@ class PriceEstimate:
     source: str
     # The individual listings the median was computed from; empty for mock
     listings: tuple[SampledListing, ...] = ()
-
-
-@dataclass(frozen=True)
-class _CachedSample:
-    listings: tuple[SampledListing, ...]
-    source: str
 
 
 _MOCK_CATALOG: dict[str, tuple[float, float, float]] = {
@@ -84,159 +116,129 @@ CONDITION_MULTIPLIERS: dict[str, float] = {
     "like_new": 0.8,
 }
 
-_EBAY_SEARCH_URL = "https://www.ebay.com/sch/i.html"
-_PRICE_STRIP = re.compile(r"[$,]")
-_ITEM_URL_ID = re.compile(r"/itm/(?:[^/?#]+/)?(\d+)")
-_CACHE_TTL = 2 * 3600  # 2 hours in seconds
-
 
 class EbayClient:
     def __init__(self) -> None:
         self._use_mock = os.getenv("EBAY_MOCK", "false").lower() == "true"
-        self._last_request_at: float = 0.0
-        # In-memory price cache: normalized_query → (monotonic_ts, sample)
-        self._price_cache: dict[str, tuple[float, _CachedSample]] = {}
-        # Persistent browser — initialised lazily on first scrape call
-        self._playwright: Playwright | None = None
-        self._browser: Browser | None = None
+        # In-memory price cache: normalized_query → (monotonic_ts, listings)
+        self._price_cache: dict[str, tuple[float, tuple[SampledListing, ...]]] = {}
         # Browse API OAuth token cache
         self._api_token: str | None = None
         self._api_token_expiry: float = 0.0
 
     # -- public ----------------------------------------------------------------
 
-    def search_prices(self, query: str, condition: str = "fair", limit: int = 20) -> PriceEstimate:
-        if self._use_mock:
-            return self._mock_estimate(query, condition)
-        if self._has_api_credentials():
-            result = self._browse_api_estimate(query, condition, limit)
-            if result is not None:
-                return result
-        return self._scrape_estimate(query, condition, limit)
+    def search_labels(
+        self, labels: list[str], condition: str = "fair", limit: int = 20
+    ) -> PriceEstimate:
+        """Price an item from its Vision labels, ranked most-confident first.
 
-    def close(self) -> None:
-        """Release the persistent Playwright browser. Call when shutting down."""
-        if self._browser is not None:
+        Each label is searched on its own — joining them into one query AND's the
+        terms together and matches almost nothing. Generic labels ("gadget") are
+        skipped. The top remaining label is tried first; if it has fewer than
+        _MIN_LISTINGS priced listings, the next labels are tried one at a time and
+        the largest sample wins. Mock pricing is used only when no label is usable,
+        none finds anything, or the API itself fails.
+        """
+        mock_query = " ".join(labels)
+        if self._use_mock:
+            return self._mock_estimate(mock_query, condition)
+        if not self._has_api_credentials():
+            logger.warning("EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not set — cannot query eBay")
+            return self._fallback_to_mock(mock_query, condition)
+
+        searchable = specific_labels(labels)
+        if not searchable:
+            logger.warning("All Vision labels are too generic to search: %r", labels)
+            return self._fallback_to_mock(mock_query, condition)
+        if searchable[0] != labels[0]:
+            logger.warning("Skipping generic label(s) %r", labels[:labels.index(searchable[0])])
+
+        best: tuple[SampledListing, ...] = ()
+        for label in searchable[:_MAX_LABELS_TO_TRY]:
             try:
-                self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._playwright is not None:
-            try:
-                self._playwright.stop()
-            except Exception:
-                pass
-            self._playwright = None
+                listings = self._search_listings(label, limit)
+            except Exception as exc:
+                # Auth, rate-limit and network failures won't be fixed by another label
+                logger.warning("eBay Browse API failed for %r — %s", label, _describe_error(exc))
+                return self._fallback_to_mock(mock_query, condition)
+            if len(listings) >= _MIN_LISTINGS:
+                return self._build_estimate(listings, condition, limit)
+            logger.warning(
+                "eBay Browse API found %d priced listing(s) for %r (need %d) — trying next label",
+                len(listings), label, _MIN_LISTINGS,
+            )
+            if len(listings) > len(best):
+                best = listings
+
+        if best:
+            return self._build_estimate(best, condition, limit)
+        return self._fallback_to_mock(mock_query, condition)
+
+    def search_prices(self, query: str, condition: str = "fair", limit: int = 20) -> PriceEstimate:
+        """Price a single search query (no label broadening)."""
+        return self.search_labels([query], condition=condition, limit=limit)
 
     # -- browse api ------------------------------------------------------------
 
     def _has_api_credentials(self) -> bool:
         return bool(os.getenv("EBAY_CLIENT_ID")) and bool(os.getenv("EBAY_CLIENT_SECRET"))
 
-    def _fetch_api_token(self) -> str | None:
+    def _fetch_api_token(self) -> str:
+        """Return a cached OAuth token, requesting a new one when expired. Raises on failure."""
         if self._api_token and time.monotonic() < self._api_token_expiry:
             return self._api_token
         client_id = os.getenv("EBAY_CLIENT_ID", "")
         client_secret = os.getenv("EBAY_CLIENT_SECRET", "")
-        if not client_id or not client_secret:
-            return None
-        try:
-            creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
-            resp = httpx.post(
-                "https://api.ebay.com/identity/v1/oauth2/token",
-                headers={
-                    "Authorization": f"Basic {creds}",
-                    "Content-Type": "application/x-www-form-urlencoded",
-                },
-                data={
-                    "grant_type": "client_credentials",
-                    "scope": "https://api.ebay.com/oauth/api_scope",
-                },
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-            self._api_token = payload["access_token"]
-            # Subtract a 60 s buffer so we refresh before the token actually expires
-            self._api_token_expiry = time.monotonic() + payload.get("expires_in", 7200) - 60
-            return self._api_token
-        except Exception:
-            return None
+        creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        resp = httpx.post(
+            _TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {creds}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={"grant_type": "client_credentials", "scope": _API_SCOPE},
+            timeout=_HTTP_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        self._api_token = payload["access_token"]
+        # Refresh slightly early so the token can't expire mid-request
+        self._api_token_expiry = (
+            time.monotonic() + payload.get("expires_in", 7200) - _TOKEN_REFRESH_BUFFER_S
+        )
+        return self._api_token
 
-    def _browse_api_estimate(self, query: str, condition: str, limit: int) -> PriceEstimate | None:
+    def _search_listings(self, query: str, limit: int) -> tuple[SampledListing, ...]:
+        """Priced listings for one query (possibly empty). Raises on API failure."""
         cached = self._cache_get(query)
-        if cached:
-            return self._build_estimate(cached, condition, limit)
-        try:
-            token = self._fetch_api_token()
-            if token is None:
-                return None
-            resp = httpx.get(
-                "https://api.ebay.com/buy/browse/v1/item_summary/search",
-                params={"q": query, "limit": limit},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=10.0,
-            )
-            resp.raise_for_status()
-            items = resp.json().get("itemSummaries", [])
-            listings: list[SampledListing] = []
-            for item in items:
-                try:
-                    price = float(item["price"]["value"])
-                except (KeyError, ValueError, TypeError):
-                    continue
-                listing_id = item.get("legacyItemId") or item.get("itemId")
-                listings.append(SampledListing(price, str(listing_id) if listing_id else None))
-            if not listings:
-                return None
-            sample = _CachedSample(tuple(listings), SOURCE_BROWSE_API)
-            self._cache_set(query, sample)
-            return self._build_estimate(sample, condition, limit)
-        except Exception:
-            return None
+        if cached is not None:
+            return cached
+        resp = httpx.get(
+            _SEARCH_URL,
+            params={"q": query, "limit": limit},
+            headers={"Authorization": f"Bearer {self._fetch_api_token()}"},
+            timeout=_HTTP_TIMEOUT_S,
+        )
+        resp.raise_for_status()
+        listings: list[SampledListing] = []
+        for item in resp.json().get("itemSummaries", []):
+            try:
+                price = float(item["price"]["value"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            listing_id = item.get("legacyItemId") or item.get("itemId")
+            listings.append(SampledListing(price, str(listing_id) if listing_id else None))
+        result = tuple(listings)
+        if result:
+            self._cache_set(query, result)
+        return result
 
-    # -- cache -----------------------------------------------------------------
-
-    def _cache_key(self, query: str) -> str:
-        return query.strip().lower()
-
-    def _cache_get(self, query: str) -> _CachedSample | None:
-        entry = self._price_cache.get(self._cache_key(query))
-        if entry is None:
-            return None
-        ts, sample = entry
-        if time.monotonic() - ts > _CACHE_TTL:
-            del self._price_cache[self._cache_key(query)]
-            return None
-        return sample
-
-    def _cache_set(self, query: str, sample: _CachedSample) -> None:
-        self._price_cache[self._cache_key(query)] = (time.monotonic(), sample)
-
-    # -- browser ---------------------------------------------------------------
-
-    def _get_page(self):  # type: ignore[return]
-        """Return a fresh page from the persistent browser, starting it if needed."""
-        if self._playwright is None:
-            self._playwright = sync_playwright().start()
-        if self._browser is None or not self._browser.is_connected():
-            self._browser = self._playwright.chromium.launch(headless=True)
-        return self._browser.new_page()
-
-    # -- scraper ---------------------------------------------------------------
-
-    def _throttle(self) -> None:
-        """Enforce a random 1–3 s gap between consecutive live requests."""
-        elapsed = time.monotonic() - self._last_request_at
-        gap = random.uniform(1.0, 3.0)
-        if elapsed < gap:
-            time.sleep(gap - elapsed)
-        self._last_request_at = time.monotonic()
-
-    def _build_estimate(self, sample: _CachedSample, condition: str, limit: int) -> PriceEstimate:
+    def _build_estimate(
+        self, listings: tuple[SampledListing, ...], condition: str, limit: int
+    ) -> PriceEstimate:
         multiplier = CONDITION_MULTIPLIERS.get(condition, CONDITION_MULTIPLIERS["fair"])
-        listings = sample.listings[:limit]
+        listings = listings[:limit]
         prices = [listing.price for listing in listings]
         # Median is more resistant to outliers than mean — one $5,000 listing
         # shouldn't inflate the estimate for an item that typically sells for $50
@@ -251,69 +253,34 @@ class EbayClient:
             is_mock=False,
             condition=condition,
             multiplier_used=multiplier,
-            source=sample.source,
+            source=SOURCE_BROWSE_API,
             listings=listings,
         )
 
-    def _scrape_estimate(self, query: str, condition: str, limit: int) -> PriceEstimate:
-        # Cache hit — reapply the condition multiplier to the stored prices
-        cached = self._cache_get(query)
-        if cached:
-            return self._build_estimate(cached, condition, limit)
+    # -- cache -----------------------------------------------------------------
 
-        self._throttle()
-        try:
-            params = {
-                "_nkw": query,
-                "LH_Sold": "1",     # sold listings only
-                "LH_Complete": "1", # completed listings
-                "_ipg": str(limit),
-            }
-            url = f"{_EBAY_SEARCH_URL}?{urlencode(params)}"
+    def _cache_key(self, query: str) -> str:
+        return query.strip().lower()
 
-            page = self._get_page()
-            try:
-                # "load" fires after JS runs; 3 s extra lets lazy price widgets settle
-                page.goto(url, wait_until="load", timeout=30_000)
-                page.wait_for_timeout(3_000)
-                html = page.content()
-            finally:
-                page.close()
+    def _cache_get(self, query: str) -> tuple[SampledListing, ...] | None:
+        entry = self._price_cache.get(self._cache_key(query))
+        if entry is None:
+            return None
+        ts, listings = entry
+        if time.monotonic() - ts > _CACHE_TTL:
+            del self._price_cache[self._cache_key(query)]
+            return None
+        return listings
 
-            soup = BeautifulSoup(html, "html.parser")
-            listings: list[SampledListing] = []
-            for el in soup.select("span.s-card__price"):
-                # Skip crossed-out asking prices on Best-Offer-accepted listings —
-                # the actual accepted amount is not disclosed, so the number is wrong
-                if "strikethrough" in (el.get("class") or []):
-                    continue
-                text = el.get_text(strip=True)
-                # Skip price ranges like "$10.00 to $50.00"
-                if " to " in text.lower():
-                    continue
-                cleaned = _PRICE_STRIP.sub("", text).strip()
-                try:
-                    price = float(cleaned)
-                except ValueError:
-                    continue
-                listings.append(SampledListing(price, _scraped_listing_id(el)))
-
-            listings = listings[:limit]
-        except Exception:
-            # Any browser or network error — fall back to mock so the pipeline
-            # keeps running rather than returning a 502 to the caller
-            return self._mock_estimate(query, condition)
-
-        if not listings:
-            # Page loaded but no parseable prices (bot-check, zero results, layout
-            # change) — fall back to mock rather than returning a dead estimate
-            return self._mock_estimate(query, condition)
-
-        sample = _CachedSample(tuple(listings), SOURCE_SOLD_SCRAPE)
-        self._cache_set(query, sample)
-        return self._build_estimate(sample, condition, limit)
+    def _cache_set(self, query: str, listings: tuple[SampledListing, ...]) -> None:
+        self._price_cache[self._cache_key(query)] = (time.monotonic(), listings)
 
     # -- mock ------------------------------------------------------------------
+
+    def _fallback_to_mock(self, query: str, condition: str) -> PriceEstimate:
+        """Mock estimate after live pricing failed; the causes are logged just before."""
+        logger.warning("eBay could not price %r — falling back to mock pricing", query)
+        return self._mock_estimate(query, condition)
 
     def _mock_estimate(self, query: str, condition: str) -> PriceEstimate:
         q = query.lower()
@@ -334,22 +301,3 @@ class EbayClient:
             multiplier_used=multiplier,
             source=SOURCE_MOCK,
         )
-
-
-def _scraped_listing_id(price_el: Tag) -> str | None:
-    """Best-effort eBay item ID for a result card, or None if not exposed.
-
-    Checks the card's data-listingid attribute first, then falls back to the
-    numeric ID in the card's /itm/ link.
-    """
-    card = price_el.find_parent("li")
-    if card is None:
-        return None
-    listing_id = card.get("data-listingid")
-    if listing_id:
-        return str(listing_id)
-    link = card.find("a", href=_ITEM_URL_ID)
-    if link is None:
-        return None
-    match = _ITEM_URL_ID.search(link["href"])
-    return match.group(1) if match else None
