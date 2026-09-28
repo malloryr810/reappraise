@@ -46,9 +46,9 @@ VALUES (%(item_id)s, %(ebay_listing_id)s, %(sampled_price)s);
 
 -- name: insert_estimate
 INSERT INTO price_estimates (item_id, market_median, estimated_price, source,
-                             search_term, search_source)
+                             search_term, search_source, vision_label)
 VALUES (%(item_id)s, %(market_median)s, %(estimated_price)s, %(source)s,
-        %(search_term)s, %(search_source)s);
+        %(search_term)s, %(search_source)s, %(vision_label)s);
 
 
 -- ===========================================================================
@@ -87,6 +87,14 @@ WHERE estimate_id = %(estimate_id)s;
 
 
 -- ===========================================================================
+-- Label taxonomy (see labels.py)
+-- ===========================================================================
+
+-- name: label_taxonomy
+SELECT label, canonical_term, kind FROM labels;
+
+
+-- ===========================================================================
 -- History read path
 -- ===========================================================================
 
@@ -107,6 +115,7 @@ SELECT pe.estimate_id,
        pe.source,
        pe.search_term,
        pe.search_source,
+       pe.vision_label,
        pe.created_at,
        ls.sample_size,
        ls.low,
@@ -138,7 +147,7 @@ WHERE i.item_id = %(item_id)s;
 
 -- name: item_estimates
 SELECT estimate_id, market_median, estimated_price, source,
-       search_term, search_source, created_at
+       search_term, search_source, vision_label, created_at
 FROM price_estimates
 WHERE item_id = %(item_id)s
 ORDER BY created_at DESC, estimate_id DESC;
@@ -248,7 +257,7 @@ ORDER BY category;
 
 
 -- name: accuracy_by_search_term
--- How far estimates are from real prices, per search term and overall.
+-- How far estimates are from real prices, per search and overall.
 -- Two bases, never mixed:
 --   sold_price  - what the item sold for. This is the accuracy figure.
 --   final_price - the price a volunteer set after seeing the estimate. It is
@@ -256,12 +265,19 @@ ORDER BY category;
 -- Error is estimate minus actual: positive bias means the app prices too high.
 -- Each item counts once, through its latest estimate that has an outcome,
 -- matching the latest-estimate rule above; mock estimates are excluded.
--- Rows with search_term NULL are the overall figures; estimates made before
--- search terms were recorded are grouped as '(not recorded)'.
+-- Rows are per (search_source, search_term); rows with both NULL are the
+-- overall figures. Estimates made before search terms were recorded are
+-- grouped as '(not recorded)'.
+-- search_term here is the canonical term, through the labels table (a term
+-- not listed there is its own): "road bicycle" and "bicycle" searches count
+-- together. Typed descriptions are canonicalised the same way, but stay in
+-- their own row, since a volunteer's text and a photo label are different
+-- evidence.
 -- Medians use the ROW_NUMBER()/COUNT() method from median_from_listings, once
 -- per ordering (percentage error and dollar error rank rows differently).
 WITH latest AS (
-    SELECT pe.search_term,
+    SELECT pe.search_source,
+           COALESCE(l.canonical_term, pe.search_term) AS search_term,
            pe.estimated_price,
            o.final_price,
            o.sold_price,
@@ -269,14 +285,16 @@ WITH latest AS (
                               ORDER BY pe.created_at DESC, pe.estimate_id DESC) AS rn
     FROM outcomes o
     JOIN price_estimates pe ON pe.estimate_id = o.estimate_id
+    LEFT JOIN labels l      ON l.label = pe.search_term AND l.kind = 'object'
     WHERE pe.source <> 'mock'
 ),
 compared AS (
-    SELECT 'sold_price' AS basis, search_term, estimated_price, sold_price AS actual_price
+    SELECT 'sold_price' AS basis, search_source, search_term,
+           estimated_price, sold_price AS actual_price
     FROM latest
     WHERE rn = 1 AND sold_price IS NOT NULL
     UNION ALL
-    SELECT 'final_price', search_term, estimated_price, final_price
+    SELECT 'final_price', search_source, search_term, estimated_price, final_price
     FROM latest
     WHERE rn = 1
 ),
@@ -287,16 +305,17 @@ usable AS (
     SELECT * FROM compared WHERE actual_price > 0
 ),
 grouped AS (
-    -- Every comparison is counted once under its search term and once overall
-    SELECT basis, COALESCE(search_term, '(not recorded)') AS search_term,
+    -- Every comparison is counted once under its search and once overall
+    SELECT basis, search_source, COALESCE(search_term, '(not recorded)') AS search_term,
            estimated_price, actual_price
     FROM usable
     UNION ALL
-    SELECT basis, NULL, estimated_price, actual_price
+    SELECT basis, NULL, NULL, estimated_price, actual_price
     FROM usable
 ),
 errors AS (
     SELECT basis,
+           search_source,
            search_term,
            estimated_price - actual_price             AS signed_error,
            ABS(estimated_price - actual_price)        AS abs_error,
@@ -306,12 +325,16 @@ errors AS (
 ),
 ranked AS (
     SELECT errors.*,
-           ROW_NUMBER() OVER (PARTITION BY basis, search_term ORDER BY abs_error) AS abs_rn,
-           ROW_NUMBER() OVER (PARTITION BY basis, search_term ORDER BY ape)       AS ape_rn,
-           COUNT(*)     OVER (PARTITION BY basis, search_term)                    AS group_n
+           ROW_NUMBER() OVER w_abs AS abs_rn,
+           ROW_NUMBER() OVER w_ape AS ape_rn,
+           COUNT(*)     OVER w     AS group_n
     FROM errors
+    WINDOW w     AS (PARTITION BY basis, search_source, search_term),
+           w_abs AS (w ORDER BY abs_error),
+           w_ape AS (w ORDER BY ape)
 )
 SELECT basis,
+       search_source,
        search_term,
        COUNT(*)                                                             AS n,
        ROUND(AVG(ape), 2)                                                   AS mape_pct,
@@ -321,5 +344,5 @@ SELECT basis,
                       THEN abs_error END), 2)                               AS median_abs_error,
        ROUND(AVG(signed_error), 2)                                          AS bias
 FROM ranked
-GROUP BY basis, search_term
-ORDER BY basis, search_term IS NOT NULL, n DESC, search_term;
+GROUP BY basis, search_source, search_term
+ORDER BY basis, search_term IS NOT NULL, n DESC, search_term, search_source;

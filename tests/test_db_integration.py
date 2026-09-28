@@ -19,12 +19,14 @@ from fastapi.testclient import TestClient
 import app as app_module
 import repository
 from db import (
-    DbConfig, applied_migrations, connect, init_schema, migration_files, rollback_statements,
+    DbConfig, _statements, applied_migrations, connect, init_schema, migration_files,
+    pending_migrations, rollback_statements,
 )
 from ebay import (
     SEARCH_SOURCE_USER, SEARCH_SOURCE_VISION, SOURCE_BROWSE_API, SOURCE_MOCK,
     PriceEstimate, SampledListing,
 )
+from labels import LabelTaxonomy
 from vision import ItemLabel
 
 pytestmark = pytest.mark.integration
@@ -114,7 +116,11 @@ def test_init_schema_applies_every_migration(db_config):
 
 def test_migration_upgrades_a_database_created_before_it(db_config):
     _save(db_config, "lamp", [10.0, 20.0])  # existing data must survive the upgrade
-    # Rewind the test database to the pre-migration shape a real dev database has
+    # Rewind the test database to the pre-migration shape a real dev database had.
+    # Migrations after 002 undo themselves through their rollback notes (their
+    # ALTERs can't be re-applied on top of themselves); 001 and 002 predate
+    # rollback notes, so they are undone by hand.
+    _rewind_to(db_config, "002_add_estimate_search_term")
     with connect(db_config) as conn, conn.cursor() as cur:
         cur.execute("ALTER TABLE items DROP COLUMN user_description")
         cur.execute("ALTER TABLE price_estimates DROP CHECK chk_estimates_search_source")
@@ -522,12 +528,19 @@ def test_migrations_upgrade_a_database_at_002(db_config):
     _save(db_config, "lamp", [10.0, 20.0])  # existing data must survive the upgrade
     rewound = _rewind_to(db_config, "002_add_estimate_search_term")
     try:
-        assert "003_create_outcomes" in rewound
-        assert "outcomes" not in _tables(db_config)
+        assert rewound[:3] == ["003_create_outcomes", "004_create_labels", "005_add_estimate_vision_label"]
+        assert not {"outcomes", "labels"} & _tables(db_config)
+        assert "vision_label" not in _columns(db_config, "price_estimates")
+        with connect(db_config) as conn:
+            assert pending_migrations(conn) == rewound
 
         assert init_schema(db_config) == rewound
 
-        assert "outcomes" in _tables(db_config)
+        with connect(db_config) as conn:
+            assert pending_migrations(conn) == []
+        assert {"outcomes", "labels"} <= _tables(db_config)
+        assert "vision_label" in _columns(db_config, "price_estimates")
+        assert _count(db_config, "labels") > 0  # the seed is part of the migration
         assert _count(db_config, "items") == 1
         assert _count(db_config, "listings_sampled") == 2
     finally:
@@ -538,14 +551,17 @@ def test_migrations_upgrade_a_database_at_002(db_config):
 # Outcomes
 # ---------------------------------------------------------------------------
 
-def _priced(config, term: str, estimated_price: float, *, source: str = SOURCE_BROWSE_API) -> int:
+def _priced(
+    config, term: str, estimated_price: float, *,
+    source: str = SOURCE_BROWSE_API, search_source: str = SEARCH_SOURCE_VISION,
+) -> int:
     """Save an appraisal whose estimate is exactly `estimated_price`; returns estimate_id.
 
     One listing at estimated_price / 0.6, so the fair-condition estimate lands on it.
     """
     estimate = replace(
         _estimate([round(estimated_price / 0.6, 2)], source=source),
-        search_term=term, search_source=SEARCH_SOURCE_VISION,
+        search_term=term, search_source=search_source,
     )
     with connect(config) as conn:
         return repository.save_appraisal(
@@ -771,10 +787,146 @@ def test_outcome_endpoint_and_accuracy_report_round_trip(db_config, monkeypatch)
     report = client.get("/analytics/accuracy?min_n=1").json()
     assert report["accuracy"]["basis"] == "sold_price"
     assert report["accuracy"]["overall"] == {
-        "search_term": None, "n": 1, "mape_pct": 20.0, "median_ape_pct": 20.0,
+        "search_source": None, "search_term": None, "n": 1, "mape_pct": 20.0, "median_ape_pct": 20.0,
         "median_abs_error": 10.0, "bias": 10.0, "is_below_min_n": False,
     }
     assert client.get("/analytics/accuracy").json()["accuracy"]["overall"]["is_below_min_n"]
     assert [r["search_term"] for r in report["accuracy"]["by_search_term"]] == ["lamp"]
     agreement = report["agreement_with_volunteer_price"]
     assert (agreement["basis"], agreement["overall"]["mape_pct"]) == ("final_price", 9.09)
+
+
+# ---------------------------------------------------------------------------
+# Label taxonomy (seeded by migration 004)
+# ---------------------------------------------------------------------------
+
+def _label_rows(config) -> dict[str, tuple]:
+    with connect(config) as conn:
+        return {r["label"]: (r["canonical_term"], r["kind"]) for r in repository.label_taxonomy(conn)}
+
+
+def test_seeded_taxonomy_loads_and_classifies(db_config):
+    rows = _label_rows(db_config)
+
+    # Every word of the original hard-coded denylist is seeded as generic
+    for word in ("gadget", "technology", "product", "object", "item", "equipment", "supplies"):
+        assert rows[word] == (None, "generic"), word
+    assert rows["plastic"] == (None, "material")
+    assert rows["red"] == (None, "color")
+    assert rows["road bicycle"] == ("bicycle", "object")
+
+    with connect(db_config) as conn:
+        taxonomy = LabelTaxonomy.from_rows(repository.label_taxonomy(conn))
+    searchable, _ = taxonomy.searchable(["Plastic", "Red", "Road bicycle", "Bicycle", "Wallet"])
+    assert [(s.term, s.vision_label) for s in searchable] == [
+        ("bicycle", "Road bicycle"), ("Wallet", "Wallet"),
+    ]
+
+
+def test_label_seed_can_be_re_run(db_config):
+    before = _label_rows(db_config)
+    [(_, path)] = [(v, p) for v, p in migration_files() if v == "004_create_labels"]
+
+    with connect(db_config) as conn, conn.cursor() as cur:
+        for stmt in _statements(path):
+            cur.execute(stmt)
+
+    assert _label_rows(db_config) == before
+
+
+@pytest.mark.parametrize("canonical_term,kind", [
+    (None, "object"),         # an object needs a term to search
+    ("", "object"),           # ... and a blank one is no term
+    ("   ", "object"),
+    ("plastic", "material"),  # only objects have one
+])
+def test_label_check_constraint(db_config, canonical_term, kind):
+    with pytest.raises(pymysql.err.OperationalError), connect(db_config) as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO labels (label, canonical_term, kind) VALUES ('zz test', %s, %s)",
+            (canonical_term, kind),
+        )
+
+
+def test_vision_label_is_persisted_and_kept_on_recompute(db_config):
+    estimate = replace(
+        _estimate([100.0, 200.0]),
+        search_term="bicycle", search_source=SEARCH_SOURCE_VISION, vision_label="Road bicycle",
+    )
+    with connect(db_config) as conn:
+        item_id = repository.save_appraisal(
+            conn, category="bicycle", description="Road bicycle", estimate=estimate,
+        ).item_id
+        repository.recompute_estimate(conn, item_id, multiplier=0.8)
+        detail = repository.get_item_detail(conn, item_id)
+        [history, _] = repository.recent_estimates(conn, limit=5)
+
+    assert [e["vision_label"] for e in detail.estimates] == ["Road bicycle", "Road bicycle"]
+    assert history["vision_label"] == "Road bicycle"
+
+
+def test_appraise_searches_with_the_database_taxonomy(db_config, monkeypatch):
+    monkeypatch.setattr(app_module, "_db_config", db_config)
+    monkeypatch.setattr(app_module._ebay, "_use_mock", False)
+    monkeypatch.setenv("EBAY_CLIENT_ID", "id")
+    monkeypatch.setenv("EBAY_CLIENT_SECRET", "secret")
+    listings = tuple(SampledListing(p, f"b{i}") for i, p in enumerate([100.0, 200.0, 300.0, 400.0, 500.0]))
+    labels = [ItemLabel("Plastic", 0.97), ItemLabel("Road bicycle", 0.95), ItemLabel("Bicycle", 0.9)]
+    client = TestClient(app_module.app)
+
+    with (
+        patch.object(app_module._vision, "identify_item", return_value=labels),
+        patch.object(app_module._ebay, "_search_listings", return_value=listings) as search,
+    ):
+        resp = client.post("/appraise", files={"file": ("x.jpg", b"\xff\xd8\xff", "image/jpeg")})
+
+    assert resp.status_code == 200
+    # "Plastic" is skipped; the specific label had enough listings, so its canonical
+    # term and the merged "Bicycle" label are never queried
+    assert [c.args[0] for c in search.call_args_list] == ["Road bicycle"]
+    body = resp.json()
+    assert (body["item"], body["search_term"], body["vision_label"]) == (
+        "bicycle", "Road bicycle", "Road bicycle",
+    )
+    [row] = client.get("/history").json()
+    assert (row["category"], row["search_term"], row["vision_label"]) == (
+        "bicycle", "Road bicycle", "Road bicycle",
+    )
+    assert row["description"] == "Plastic Road bicycle Bicycle"
+
+
+def test_accuracy_groups_search_terms_by_their_canonical_term(db_config):
+    specific = _priced(db_config, "Road bicycle", 60.0)  # searched as the specific label
+    canonical = _priced(db_config, "bicycle", 30.0)      # fell back to the canonical term
+    other = _priced(db_config, "lamp", 90.0)
+    _outcome(db_config, specific, "50.00", "50.00")    # +10 → 20%
+    _outcome(db_config, canonical, "40.00", "40.00")   # -10 → 25%
+    _outcome(db_config, other, "60.00", "60.00")       # +30 → 50%
+
+    with connect(db_config) as conn:
+        rows = repository.accuracy_by_search_term(conn)
+
+    sold = {r["search_term"]: (r["n"], r["mape_pct"]) for r in rows if r["basis"] == "sold_price"}
+    assert sold == {
+        None: (3, Decimal("31.67")),
+        "bicycle": (2, Decimal("22.50")),
+        "lamp": (1, Decimal("50.00")),
+    }
+
+
+def test_typed_and_photo_searches_share_a_canonical_term_in_separate_rows(db_config):
+    typed = _priced(db_config, "road bicycle", 60.0, search_source=SEARCH_SOURCE_USER)
+    photo = _priced(db_config, "Road bicycle", 30.0)
+    _outcome(db_config, typed, "50.00", "50.00")  # +10 → 20%
+    _outcome(db_config, photo, "40.00", "40.00")  # -10 → 25%
+
+    with connect(db_config) as conn:
+        rows = repository.accuracy_by_search_term(conn)
+
+    sold = [(r["search_source"], r["search_term"], r["n"], r["mape_pct"])
+            for r in rows if r["basis"] == "sold_price"]
+    assert sold == [
+        (None, None, 2, Decimal("22.50")),  # overall counts both
+        (SEARCH_SOURCE_USER, "bicycle", 1, Decimal("20.00")),
+        (SEARCH_SOURCE_VISION, "bicycle", 1, Decimal("25.00")),
+    ]

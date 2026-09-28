@@ -3,8 +3,9 @@ from dotenv import load_dotenv
 load_dotenv()  # must run before EbayClient reads env vars
 
 import logging
-from collections.abc import Iterator
-from contextlib import contextmanager
+import os
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -17,11 +18,36 @@ import pymysql
 from pymysql.connections import Connection
 
 import repository
-from db import DbConfig, connect
-from ebay import CONDITION_MULTIPLIERS, EbayClient, PriceEstimate, specific_labels
+from db import DbConfig, connect, pending_migrations
+from ebay import CONDITION_MULTIPLIERS, EbayClient, PriceEstimate
+from labels import FALLBACK_TAXONOMY, LabelTaxonomy
 from vision import VisionClient
 
 logger = logging.getLogger("reappraise")
+
+LOG_LEVEL_ENV = "LOG_LEVEL"
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+# httpx logs every request at INFO; that would bury the warnings that matter
+_QUIET_LOGGERS = ("httpx", "httpcore")
+
+
+def _configure_logging() -> None:
+    """Print app logs with time, level and logger name; level from LOG_LEVEL (INFO).
+
+    This configures the root logger. uvicorn configures only its own loggers,
+    which don't propagate to root, so each line is printed once. basicConfig is
+    a no-op when root already has handlers, so importing twice can't double up.
+    """
+    requested = os.getenv(LOG_LEVEL_ENV, "INFO")
+    level = logging.getLevelNamesMapping().get(requested.strip().upper())
+    logging.basicConfig(level=level or logging.INFO, format=_LOG_FORMAT)
+    for name in _QUIET_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
+    if level is None:
+        logger.warning("%s=%r is not a log level; using INFO", LOG_LEVEL_ENV, requested)
+
+
+_configure_logging()
 
 # Matches items.user_description VARCHAR(255); longer input is rejected, not trimmed
 USER_DESCRIPTION_MAX = 255
@@ -68,6 +94,9 @@ class AppraiseResponse(BaseModel):
     # both None when the price came from the mock catalog
     search_term: str | None = None
     search_source: str | None = None
+    # The Vision label behind a vision_label search (search_term may be its
+    # canonical form); None otherwise
+    vision_label: str | None = None
 
 
 class HistoryEntry(BaseModel):
@@ -83,6 +112,7 @@ class HistoryEntry(BaseModel):
     source: str
     search_term: str | None
     search_source: str | None
+    vision_label: str | None
     created_at: datetime
     sample_size: int
     low: float | None
@@ -96,6 +126,7 @@ class EstimateOut(BaseModel):
     source: str
     search_term: str | None
     search_source: str | None
+    vision_label: str | None
     created_at: datetime
 
 
@@ -173,7 +204,9 @@ class OutcomeOut(BaseModel):
 
 
 class AccuracyStat(BaseModel):
-    # None on the overall figures
+    # Both None on the overall figures. search_term is the canonical term;
+    # typed descriptions and photo labels are reported in separate rows.
+    search_source: str | None
     search_term: str | None
     n: int
     mape_pct: float
@@ -204,7 +237,36 @@ _db_config = DbConfig.from_env()
 if _db_config is None:
     logger.warning("MYSQL_DATABASE not set — appraisals will not be persisted")
 
-app = FastAPI(title="Reappraise", version="0.1.0")
+
+
+def _check_migrations() -> None:
+    """Log an ERROR at startup if the database is behind the code's migrations.
+
+    New code writes columns that pending migrations add, so until they are
+    applied every save fails (appraisals are still returned, but not kept).
+    """
+    if _db_config is None:
+        return
+    try:
+        with connect(_db_config) as conn:
+            pending = pending_migrations(conn)
+    except Exception:
+        logger.warning("Could not check database migrations at startup", exc_info=True)
+        return
+    if pending:
+        logger.error(
+            "Database %r has pending migrations %s; saving appraisals will fail until "
+            "`python db.py init` is run", _db_config.database, ", ".join(pending),
+        )
+
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    _check_migrations()
+    yield
+
+
+app = FastAPI(title="Reappraise", version="0.1.0", lifespan=_lifespan)
 
 
 @app.get("/health")
@@ -235,6 +297,38 @@ def _db() -> Iterator[Connection]:
     except Exception as exc:
         logger.exception("Database error")
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+
+def _label_taxonomy() -> LabelTaxonomy:
+    """The label taxonomy from the database, or the built-in fallback.
+
+    Invalid rows are skipped (and logged) by LabelTaxonomy.from_rows. Falling
+    back keeps appraisals working, but it drops the material/colour filter and
+    the canonical merges, so it is logged as a warning every time; it happens
+    only when the table can't be read or has no valid rows.
+    """
+    if _db_config is None:
+        return FALLBACK_TAXONOMY  # already warned at startup: persistence is off
+    try:
+        with connect(_db_config) as conn:
+            rows = repository.label_taxonomy(conn)
+    except Exception:
+        logger.warning(
+            "Label taxonomy unavailable — using the built-in generic-word list", exc_info=True
+        )
+        return FALLBACK_TAXONOMY
+    try:
+        taxonomy = LabelTaxonomy.from_rows(rows)  # skips and logs invalid rows itself
+    except Exception:
+        logger.warning(
+            "Label taxonomy could not be built — using the built-in generic-word list",
+            exc_info=True,
+        )
+        return FALLBACK_TAXONOMY
+    if len(taxonomy) == 0:
+        logger.warning("labels table has no valid rows — using the built-in generic-word list")
+        return FALLBACK_TAXONOMY
+    return taxonomy
 
 
 def _persist(
@@ -296,13 +390,19 @@ async def appraise(
     # Labels arrive ranked by confidence; the eBay client searches them one at a time
     label_names = [label.name for label in labels]
     description = " ".join(label_names[:3])
-    # Name the item by its first specific label, so a generic top label like
-    # "gadget" doesn't become the stored category; fall back if all are generic
-    item_name = next(iter(specific_labels(label_names)), label_names[0])
+    taxonomy = _label_taxonomy()
+    # Name the item by the canonical term of its first searchable label, so a
+    # generic top label like "gadget" doesn't become the stored category and
+    # "road bicycle" files under "bicycle"; fall back if none is searchable
+    searchable, _ = taxonomy.searchable(label_names)
+    item_name = searchable[0].term if searchable else label_names[0]
 
     try:
         estimate = _ebay.search_labels(
-            label_names, condition=condition, user_description=manual_description
+            label_names,
+            condition=condition,
+            user_description=manual_description,
+            taxonomy=taxonomy,
         )
     except Exception as exc:
         logger.exception("eBay price lookup failed")
@@ -340,6 +440,7 @@ async def appraise(
         user_description=manual_description,
         search_term=estimate.search_term,
         search_source=estimate.search_source,
+        vision_label=estimate.vision_label,
     )
 
 

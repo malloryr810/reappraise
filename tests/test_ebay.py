@@ -6,6 +6,7 @@ import pytest
 
 import ebay
 from ebay import EbayClient, PriceEstimate
+from labels import KIND_COLOR, KIND_GENERIC, KIND_MATERIAL, KIND_OBJECT, LabelTaxonomy
 
 
 # ---------------------------------------------------------------------------
@@ -254,14 +255,110 @@ def test_all_labels_generic_falls_back_to_mock_without_searching(api_env, caplog
     assert "too generic" in caplog.text
 
 
-@pytest.mark.parametrize("labels,expected", [
-    (["gadget", "game controller"], ["game controller"]),
-    (["Technology", "Electronic Device"], ["Electronic Device"]),
-    (["sports equipment", "bicycle"], ["bicycle"]),
-    (["gadget"], []),
+# -- label taxonomy (see tests/test_labels.py for the rules themselves) ----------
+
+_TAXONOMY = LabelTaxonomy.from_rows([
+    {"label": "plastic", "canonical_term": None, "kind": KIND_MATERIAL},
+    {"label": "black", "canonical_term": None, "kind": KIND_COLOR},
+    {"label": "road bicycle", "canonical_term": "bicycle", "kind": KIND_OBJECT},
+    {"label": "gadget", "canonical_term": None, "kind": KIND_GENERIC},
 ])
-def test_specific_labels_filters_generic_terms(labels, expected):
-    assert ebay.specific_labels(labels) == expected
+
+
+def test_material_and_colour_labels_are_not_searched(api_env, caplog):
+    post, get, get_mock = _api({"wallet": _search_resp(*FIVE)})
+    with post, get:
+        estimate = EbayClient().search_labels(["Plastic", "Black", "wallet"], taxonomy=_TAXONOMY)
+
+    assert _queries(get_mock) == ["wallet"]
+    assert estimate.vision_label == "wallet"
+    assert "'Plastic', 'material'" in caplog.text
+
+
+def test_skipped_material_labels_do_not_use_up_the_label_budget(api_env):
+    labels = ["Plastic", "Black"] + [f"label{i}" for i in range(5)]
+    post, get, get_mock = _api({label: _search_resp() for label in labels})
+    with post, get:
+        EbayClient().search_labels(labels, taxonomy=_TAXONOMY)
+
+    assert _queries(get_mock) == labels[2:2 + ebay._MAX_LABELS_TO_TRY]
+
+
+def test_specific_label_with_enough_listings_is_searched_alone(api_env):
+    post, get, get_mock = _api({"Road bicycle": _search_resp(*FIVE)})
+    with post, get:
+        estimate = EbayClient().search_labels(["Road bicycle"], taxonomy=_TAXONOMY)
+
+    assert _queries(get_mock) == ["Road bicycle"]
+    assert (estimate.search_term, estimate.search_source, estimate.vision_label) == (
+        "Road bicycle", ebay.SEARCH_SOURCE_VISION, "Road bicycle",
+    )
+
+
+def test_specific_label_with_too_few_listings_falls_back_to_its_canonical_term(api_env):
+    post, get, get_mock = _api({
+        "Road bicycle": _search_resp(1500.0),
+        "bicycle": _search_resp(*FIVE),
+    })
+    with post, get:
+        estimate = EbayClient().search_labels(["Road bicycle"], taxonomy=_TAXONOMY)
+
+    assert _queries(get_mock) == ["Road bicycle", "bicycle"]
+    assert (estimate.search_term, estimate.vision_label, estimate.market_median) == (
+        "bicycle", "Road bicycle", 30.0,
+    )
+
+
+def test_labels_that_merge_are_searched_once(api_env):
+    post, get, get_mock = _api({
+        "Road bicycle": _search_resp(),
+        "bicycle": _search_resp(10.0),
+        "wheel": _search_resp(),
+    })
+    with post, get:
+        EbayClient().search_labels(["Road bicycle", "bicycle", "wheel"], taxonomy=_TAXONOMY)
+
+    # The "bicycle" label merged into "Road bicycle", so "bicycle" is queried once
+    assert _queries(get_mock) == ["Road bicycle", "bicycle", "wheel"]
+
+
+def test_a_label_and_its_canonical_term_use_one_slot_of_the_budget(api_env):
+    labels = ["Road bicycle"] + [f"label{i}" for i in range(5)]
+    post, get, get_mock = _api({q: _search_resp() for q in [*labels, "bicycle"]})
+    with post, get:
+        EbayClient().search_labels(labels, taxonomy=_TAXONOMY)
+
+    assert _queries(get_mock) == [
+        "Road bicycle", "bicycle", *labels[1:ebay._MAX_LABELS_TO_TRY],
+    ]
+
+
+def test_only_non_object_labels_fall_back_to_mock(api_env, caplog):
+    with patch("ebay.httpx.get") as get, patch("ebay.httpx.post"):
+        estimate = EbayClient().search_labels(["Plastic", "Black", "gadget"], taxonomy=_TAXONOMY)
+
+    get.assert_not_called()
+    assert estimate.is_mock is True
+    assert "too generic" in caplog.text
+
+
+def test_description_search_records_no_vision_label(api_env):
+    post, get, _ = _api({"Trek Emonda SL 5": _search_resp(*FIVE)})
+    with post, get:
+        estimate = EbayClient().search_labels(
+            ["Road bicycle"], user_description="Trek Emonda SL 5", taxonomy=_TAXONOMY,
+        )
+
+    assert (estimate.search_source, estimate.vision_label) == (ebay.SEARCH_SOURCE_USER, None)
+
+
+def test_default_taxonomy_is_the_fallback(api_env):
+    # Without the database, materials are searched, as before this taxonomy existed
+    post, get, get_mock = _api({"Plastic": _search_resp(*FIVE)})
+    with post, get:
+        EbayClient().search_labels(["Plastic"])
+
+    assert _queries(get_mock) == ["Plastic"]
 
 
 def test_mock_only_when_every_label_returns_nothing(api_env, caplog):
@@ -408,7 +505,7 @@ def test_mock_estimate_records_no_search_term(api_env):
         estimate = EbayClient().search_labels(["bicycle"], user_description="xyzzy")
 
     assert estimate.is_mock is True
-    assert (estimate.search_term, estimate.search_source) == (None, None)
+    assert (estimate.search_term, estimate.search_source, estimate.vision_label) == (None, None, None)
 
 
 # ---------------------------------------------------------------------------
