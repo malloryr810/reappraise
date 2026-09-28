@@ -1,0 +1,102 @@
+# Runs the full test suite against a real MySQL 8 server on every push and PR.
+# Google Vision and eBay are mocked in the tests, so no secrets are needed; the
+# MySQL credentials below belong to a throwaway service container.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: ci-root-only
+          MYSQL_DATABASE: reappraise_test
+          MYSQL_USER: reappraise
+          MYSQL_PASSWORD: ci-only
+        ports:
+          - 3306:3306
+        # Over TCP only, so the check can't pass against the temporary
+        # socket-only server the image runs while it initialises
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci-root-only"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=30
+
+    env:
+      MYSQL_HOST: 127.0.0.1
+      MYSQL_PORT: "3306"
+      MYSQL_USER: reappraise
+      MYSQL_PASSWORD: ci-only
+      # MYSQL_DATABASE is deliberately unset: the tests only ever touch the
+      # test database, and they refuse to run if the two names match
+      MYSQL_TEST_DATABASE: reappraise_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      # tests/test_frontend.py runs the page's JavaScript tests with node --test
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # MySQL 8.4 authenticates with caching_sha2_password. Until a user's
+      # password is cached, a login needs TLS or RSA key exchange, and PyMySQL
+      # can only do RSA with the optional cryptography package. One login with
+      # the runner's mysql client (which uses TLS) fills the cache, after which
+      # PyMySQL's fast path works without it.
+      - name: Prime MySQL's password cache
+        env:
+          MYSQL_PWD: ci-only
+        run: mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u reappraise -e "SELECT VERSION()"
+
+      - name: Apply all migrations to the empty test database
+        run: |
+          python - <<'EOF'
+          from db import DbConfig, init_schema, migration_files
+
+          applied = init_schema(DbConfig.from_env("MYSQL_TEST_DATABASE"))
+          expected = [version for version, _ in migration_files()]
+          assert applied == expected, f"applied {applied}, expected {expected}"
+          print("Applied to an empty database:", ", ".join(applied))
+          EOF
+
+      - name: Run the test suite
+        run: python -m pytest -q -rs --junitxml=pytest-report.xml
+
+      # Integration tests skip when MySQL is unreachable; in CI that must fail
+      # the job, or a broken database setup would pass as green
+      - name: Fail if any test was skipped
+        run: |
+          python - <<'EOF'
+          import xml.etree.ElementTree as ET
+
+          root = ET.parse("pytest-report.xml").getroot()
+          suite = root if root.tag == "testsuite" else root.find("testsuite")
+          tests, skipped = int(suite.get("tests")), int(suite.get("skipped"))
+          print(f"{tests} tests, {skipped} skipped")
+          if skipped:
+              raise SystemExit(f"{skipped} test(s) skipped; CI requires every test to run")
+          EOF

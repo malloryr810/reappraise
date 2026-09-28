@@ -1,5 +1,7 @@
 # Reappraise
 
+[![tests](https://github.com/malloryr810/reappraise/actions/workflows/tests.yml/badge.svg)](https://github.com/malloryr810/reappraise/actions/workflows/tests.yml)
+
 A photo-to-price tool for Habitat for Humanity ReStore volunteers: photograph a donated item and get an estimated resale price drawn from real eBay listings.
 
 ## Motivation
