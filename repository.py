@@ -3,10 +3,13 @@
 # in sql/queries.sql and is looked up by name.
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
+import pymysql
 from pymysql.connections import Connection
+from pymysql.constants import ER
 
 from db import query
 from ebay import PriceEstimate
@@ -16,7 +19,23 @@ from ebay import PriceEstimate
 _CATEGORY_MAX = 100
 _DESCRIPTION_MAX = 255
 
+# Affected-row count MySQL reports when INSERT ... ON DUPLICATE KEY UPDATE
+# inserted (2 means it updated, 0 that it updated with identical values)
+_UPSERT_INSERTED = 1
+
 Row = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class SavedAppraisal:
+    item_id: int
+    estimate_id: int
+
+
+@dataclass(frozen=True)
+class RecordedOutcome:
+    row: Row
+    is_created: bool
 
 
 @dataclass(frozen=True)
@@ -33,13 +52,13 @@ def save_appraisal(
     description: str,
     estimate: PriceEstimate,
     user_description: str | None = None,
-) -> int:
+) -> SavedAppraisal:
     """Persist one appraisal (category, item, sampled listings, estimate).
 
     `description` is Vision's labels and `user_description` is what a volunteer
     typed; they are stored separately so the two are never mixed up.
-    Returns the new item_id. The caller's `with connect(...)` block makes this
-    all-or-nothing.
+    Returns the new item and estimate ids. The caller's `with connect(...)`
+    block makes this all-or-nothing.
     """
     with conn.cursor() as cur:
         cur.execute(query("upsert_category"), {"name": category.strip()[:_CATEGORY_MAX]})
@@ -81,7 +100,8 @@ def save_appraisal(
                 "search_source": estimate.search_source,
             },
         )
-    return item_id
+        estimate_id = cur.lastrowid
+    return SavedAppraisal(item_id=item_id, estimate_id=estimate_id)
 
 
 def recent_estimates(conn: Connection, limit: int = 20) -> list[Row]:
@@ -148,7 +168,83 @@ def recompute_estimate(
     }
 
 
+# -- outcomes -----------------------------------------------------------------
+
+
+def get_outcome(conn: Connection, estimate_id: int) -> Row | None:
+    return _fetch_one(conn, "get_outcome", estimate_id=estimate_id)
+
+
+def estimate_exists(conn: Connection, estimate_id: int) -> bool:
+    return _fetch_one(conn, "estimate_exists", estimate_id=estimate_id) is not None
+
+
+def record_outcome(
+    conn: Connection,
+    *,
+    estimate_id: int,
+    final_price: Decimal,
+    sold_price: Decimal | None = None,
+    sold_at: datetime | None = None,
+) -> RecordedOutcome | None:
+    """Insert or update an estimate's outcome in one statement (see upsert_outcome).
+
+    A second call for the same estimate replaces final_price and keeps any sale
+    already recorded unless a new one is given. Returns None if the estimate
+    doesn't exist.
+    """
+    try:
+        with conn.cursor() as cur:
+            affected = cur.execute(
+                query("upsert_outcome"),
+                {
+                    "estimate_id": estimate_id,
+                    "final_price": final_price,
+                    "sold_price": sold_price,
+                    "sold_at": sold_at,
+                },
+            )
+    except pymysql.err.IntegrityError as exc:
+        if exc.args[0] == ER.NO_REFERENCED_ROW_2:  # no such estimate (foreign key)
+            return None
+        raise
+    return RecordedOutcome(
+        row=get_outcome(conn, estimate_id), is_created=affected == _UPSERT_INSERTED
+    )
+
+
+def update_outcome(
+    conn: Connection,
+    *,
+    estimate_id: int,
+    final_price: Decimal | None = None,
+    sold_price: Decimal | None = None,
+    sold_at: datetime | None = None,
+) -> Row | None:
+    """Change an existing outcome, e.g. to record the sale; None leaves a field as is.
+
+    Never inserts, so it needs no final_price. Returns the row, or None if the
+    estimate has no outcome yet.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            query("update_outcome"),
+            {
+                "estimate_id": estimate_id,
+                "final_price": final_price,
+                "sold_price": sold_price,
+                "sold_at": sold_at,
+            },
+        )
+    # Affected rows can't tell "no outcome" from "no change", so read it back
+    return get_outcome(conn, estimate_id)
+
+
 # -- analytics ----------------------------------------------------------------
+
+
+def accuracy_by_search_term(conn: Connection) -> list[Row]:
+    return _fetch_all(conn, "accuracy_by_search_term")
 
 
 def avg_price_by_category(conn: Connection) -> list[Row]:

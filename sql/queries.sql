@@ -52,6 +52,41 @@ VALUES (%(item_id)s, %(market_median)s, %(estimated_price)s, %(source)s,
 
 
 -- ===========================================================================
+-- Outcomes (what an appraised item was priced at and sold for)
+-- ===========================================================================
+
+-- name: estimate_exists
+SELECT 1 AS found FROM price_estimates WHERE estimate_id = %(estimate_id)s;
+
+-- name: get_outcome
+SELECT outcome_id, estimate_id, final_price, sold_price, sold_at, created_at
+FROM outcomes
+WHERE estimate_id = %(estimate_id)s;
+
+-- name: upsert_outcome
+-- One statement, so two requests for the same estimate can't both insert: the
+-- UNIQUE key on estimate_id turns the second into an update. Affected rows
+-- tell the caller which happened: 1 = inserted, 2 = updated, 0 = updated with
+-- identical values. A NULL sold_price or sold_at keeps the stored value.
+-- `AS new` is the row alias (MySQL 8.0.19+) that replaces deprecated VALUES().
+INSERT INTO outcomes (estimate_id, final_price, sold_price, sold_at)
+VALUES (%(estimate_id)s, %(final_price)s, %(sold_price)s, %(sold_at)s) AS new
+ON DUPLICATE KEY UPDATE
+    final_price = new.final_price,
+    sold_price  = COALESCE(new.sold_price, outcomes.sold_price),
+    sold_at     = COALESCE(new.sold_at, outcomes.sold_at);
+
+-- name: update_outcome
+-- For recording a sale without a final_price, which can't create a row
+-- (final_price is NOT NULL). NULL leaves a field as it was.
+UPDATE outcomes
+SET final_price = COALESCE(%(final_price)s, final_price),
+    sold_price  = COALESCE(%(sold_price)s, sold_price),
+    sold_at     = COALESCE(%(sold_at)s, sold_at)
+WHERE estimate_id = %(estimate_id)s;
+
+
+-- ===========================================================================
 -- History read path
 -- ===========================================================================
 
@@ -210,3 +245,81 @@ SELECT category, item_count
 FROM volume
 WHERE volume_rank = 1
 ORDER BY category;
+
+
+-- name: accuracy_by_search_term
+-- How far estimates are from real prices, per search term and overall.
+-- Two bases, never mixed:
+--   sold_price  - what the item sold for. This is the accuracy figure.
+--   final_price - the price a volunteer set after seeing the estimate. It is
+--                 anchored on the estimate, so it measures agreement only.
+-- Error is estimate minus actual: positive bias means the app prices too high.
+-- Each item counts once, through its latest estimate that has an outcome,
+-- matching the latest-estimate rule above; mock estimates are excluded.
+-- Rows with search_term NULL are the overall figures; estimates made before
+-- search terms were recorded are grouped as '(not recorded)'.
+-- Medians use the ROW_NUMBER()/COUNT() method from median_from_listings, once
+-- per ordering (percentage error and dollar error rank rows differently).
+WITH latest AS (
+    SELECT pe.search_term,
+           pe.estimated_price,
+           o.final_price,
+           o.sold_price,
+           ROW_NUMBER() OVER (PARTITION BY pe.item_id
+                              ORDER BY pe.created_at DESC, pe.estimate_id DESC) AS rn
+    FROM outcomes o
+    JOIN price_estimates pe ON pe.estimate_id = o.estimate_id
+    WHERE pe.source <> 'mock'
+),
+compared AS (
+    SELECT 'sold_price' AS basis, search_term, estimated_price, sold_price AS actual_price
+    FROM latest
+    WHERE rn = 1 AND sold_price IS NOT NULL
+    UNION ALL
+    SELECT 'final_price', search_term, estimated_price, final_price
+    FROM latest
+    WHERE rn = 1
+),
+usable AS (
+    -- The CHECK constraints already forbid zero prices; this guard keeps a zero
+    -- from turning a percentage error into NULL and shifting the median ranks
+    -- if those constraints were ever missing or unenforced
+    SELECT * FROM compared WHERE actual_price > 0
+),
+grouped AS (
+    -- Every comparison is counted once under its search term and once overall
+    SELECT basis, COALESCE(search_term, '(not recorded)') AS search_term,
+           estimated_price, actual_price
+    FROM usable
+    UNION ALL
+    SELECT basis, NULL, estimated_price, actual_price
+    FROM usable
+),
+errors AS (
+    SELECT basis,
+           search_term,
+           estimated_price - actual_price             AS signed_error,
+           ABS(estimated_price - actual_price)        AS abs_error,
+           -- multiply before dividing so DECIMAL division keeps 4 extra places
+           ABS(estimated_price - actual_price) * 100 / actual_price AS ape
+    FROM grouped
+),
+ranked AS (
+    SELECT errors.*,
+           ROW_NUMBER() OVER (PARTITION BY basis, search_term ORDER BY abs_error) AS abs_rn,
+           ROW_NUMBER() OVER (PARTITION BY basis, search_term ORDER BY ape)       AS ape_rn,
+           COUNT(*)     OVER (PARTITION BY basis, search_term)                    AS group_n
+    FROM errors
+)
+SELECT basis,
+       search_term,
+       COUNT(*)                                                             AS n,
+       ROUND(AVG(ape), 2)                                                   AS mape_pct,
+       ROUND(AVG(CASE WHEN ape_rn IN (FLOOR((group_n + 1) / 2), CEIL((group_n + 1) / 2))
+                      THEN ape END), 2)                                     AS median_ape_pct,
+       ROUND(AVG(CASE WHEN abs_rn IN (FLOOR((group_n + 1) / 2), CEIL((group_n + 1) / 2))
+                      THEN abs_error END), 2)                               AS median_abs_error,
+       ROUND(AVG(signed_error), 2)                                          AS bias
+FROM ranked
+GROUP BY basis, search_term
+ORDER BY basis, search_term IS NOT NULL, n DESC, search_term;

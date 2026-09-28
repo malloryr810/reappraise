@@ -23,6 +23,7 @@ _MIGRATIONS_DIR = _SQL_DIR / "migrations"
 _NAME_HEADER = re.compile(r"^--\s*name:\s*(\w+)\s*$", re.MULTILINE)
 _COMMENT_LINE = re.compile(r"^\s*--.*$", re.MULTILINE)
 _MIGRATION_NAME = re.compile(r"^\d{3}_\w+\.sql$")
+_ROLLBACK_NOTE = re.compile(r"^--\s*rollback:\s*(.+?);?\s*$", re.MULTILINE)
 _CONNECT_TIMEOUT_S = 5
 
 
@@ -103,6 +104,15 @@ def query(name: str) -> str:
 def _statements(path: Path) -> list[str]:
     text = _strip_comments(path.read_text())
     return [stmt.strip() for stmt in text.split(";") if stmt.strip()]
+
+
+def rollback_statements(path: Path) -> list[str]:
+    """The statements in a migration's `-- rollback:` comment lines, in order.
+
+    They are never run by init_schema; they document how to undo the migration
+    by hand, and the integration tests execute them to prove they work.
+    """
+    return _ROLLBACK_NOTE.findall(path.read_text())
 
 
 def schema_statements() -> list[str]:

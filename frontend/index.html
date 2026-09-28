@@ -230,7 +230,8 @@
     /* ── Description input ───────────────────────────── */
     label.card-title { display: block; }
 
-    #input-description {
+    #input-description,
+    #input-final-price {
       width: 100%;
       padding: 10px 12px;
       border: 1.5px solid var(--border);
@@ -241,9 +242,11 @@
       background: var(--surface);
     }
 
-    #input-description::placeholder { color: var(--text-2); opacity: 0.8; }
+    #input-description::placeholder,
+    #input-final-price::placeholder { color: var(--text-2); opacity: 0.8; }
 
-    #input-description:focus-visible {
+    #input-description:focus-visible,
+    #input-final-price:focus-visible {
       outline: 2px solid var(--primary);
       outline-offset: 1px;
       border-color: var(--primary);
@@ -435,6 +438,33 @@
       text-align: right;
     }
 
+    /* Price actually used (POST /estimates/{id}/outcome) */
+    #outcome-form { display: none; }
+    #outcome-form.visible { display: block; }
+
+    .outcome-row { display: flex; gap: 8px; }
+
+    #btn-outcome {
+      padding: 10px 18px;
+      background: var(--primary);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-family: inherit;
+      font-size: 0.9rem;
+      font-weight: 700;
+      cursor: pointer;
+    }
+
+    #btn-outcome:disabled { opacity: 0.6; cursor: default; }
+
+    #btn-outcome:focus-visible {
+      outline: 2px solid var(--primary);
+      outline-offset: 2px;
+    }
+
+    #outcome-status { display: block; margin-top: 6px; }
+
     /* Reset button */
     #btn-reset {
       width: 100%;
@@ -602,6 +632,17 @@
       </div>
     </div>
 
+    <!-- Shown only when the appraisal was saved; posts to /estimates/{id}/outcome -->
+    <form class="card" id="outcome-form">
+      <label class="card-title" for="input-final-price">Set the price you actually used (optional)</label>
+      <div class="outcome-row">
+        <input type="number" id="input-final-price" min="0.01" max="99999999.99" step="0.01"
+               inputmode="decimal" placeholder="e.g. 45.00">
+        <button type="submit" id="btn-outcome">Save</button>
+      </div>
+      <span class="history-meta" id="outcome-status" role="status"></span>
+    </form>
+
     <button type="button" id="btn-reset">Price Another Item</button>
 
   </div>
@@ -631,10 +672,15 @@
   const errorMsg     = document.getElementById('error-msg');
   const results      = document.getElementById('results');
   const inputDescription = document.getElementById('input-description');
+  const outcomeForm     = document.getElementById('outcome-form');
+  const inputFinalPrice = document.getElementById('input-final-price');
+  const btnOutcome      = document.getElementById('btn-outcome');
+  const outcomeStatus   = document.getElementById('outcome-status');
 
   // ── State ─────────────────────────────────────────────────────
   let selectedFile    = null;
   let previewObjectURL = null;
+  let currentEstimateId = null;  // the saved estimate behind the result on screen
 
   // ── Photo selection ───────────────────────────────────────────
   btnCamera.addEventListener('click',  () => inputCamera.click());
@@ -752,6 +798,7 @@
     document.getElementById('res-range').textContent     = `${usd.format(est.low)} – ${usd.format(est.high)}`;
     document.getElementById('res-sample').textContent    = `${est.sample_size} eBay listing${est.sample_size !== 1 ? 's' : ''}`;
     renderSearch(data);
+    resetOutcome(data.estimate_id);
 
     show(results);
     results.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -780,6 +827,41 @@
   function descriptionFellBack(row) {
     return Boolean(row.user_description) && row.search_source === 'vision_label';
   }
+
+  // ── Price actually used ───────────────────────────────────────
+  // Only offered when the appraisal was saved (estimate_id is null when persistence is off).
+  function resetOutcome(estimateId) {
+    currentEstimateId = estimateId ?? null;
+    inputFinalPrice.value = '';
+    outcomeStatus.textContent = '';
+    btnOutcome.disabled = false;
+    currentEstimateId === null ? hide(outcomeForm) : show(outcomeForm);
+  }
+
+  outcomeForm.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const finalPrice = Number(inputFinalPrice.value);
+    if (!inputFinalPrice.value || !inputFinalPrice.checkValidity() || !(finalPrice > 0)) {
+      outcomeStatus.textContent = 'Enter a price above $0 with at most 2 decimal places.';
+      return;
+    }
+
+    btnOutcome.disabled = true;
+    outcomeStatus.textContent = 'Saving…';
+    try {
+      const resp = await fetch(`/estimates/${currentEstimateId}/outcome`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ final_price: finalPrice }),
+      });
+      if (!resp.ok) throw new Error(`Server returned ${resp.status}`);
+      outcomeStatus.textContent = `Saved ${usd.format(finalPrice)}.`;
+    } catch (_) {
+      outcomeStatus.textContent = 'Could not save the price. Please try again.';
+    } finally {
+      btnOutcome.disabled = false;
+    }
+  });
 
   // ── Helpers ───────────────────────────────────────────────────
   function show(el) { el.classList.add('visible'); }

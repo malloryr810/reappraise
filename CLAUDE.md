@@ -3,19 +3,21 @@
 Photo → price tool for Habitat for Humanity ReStore volunteers. Google Vision labels the item, the eBay Browse API finds a market median, and a condition multiplier (fair = 0.6, the ReStore's 60% policy) turns it into a resale price. Every appraisal is saved to MySQL for history and analytics. See README.md for the full architecture and schema.
 
 ## Running it
+- The project lives at `~/code/reappraise`. It moved off `~/Desktop` on 2026-09-28 because iCloud evicted files in `venv/` and `.git/`, which made imports hang. Keep it out of iCloud-synced folders (Desktop, Documents).
 - Use `venv/` only. `.venv/` was a stale duplicate and has been deleted; don't recreate it.
 - Server: `venv/bin/uvicorn app:app --reload --reload-dir . --reload-exclude 'venv/*'` (binds 127.0.0.1:8000)
 - Before testing, check `lsof -nP -iTCP:8000 -sTCP:LISTEN` shows one server. A stale server bound to `*:8000` was found and removed on 2026-09-21. Two PIDs sharing one socket is normal (uvicorn reloader + worker).
-- Tests: `venv/bin/python -m pytest -q`. There are 108 tests: 27 app, 4 db (migration file naming), 44 ebay, 6 vision, 27 MySQL integration. Integration tests **skip** when MySQL is down, so "all passed" only covers the DB if 0 were skipped.
+- Tests: `venv/bin/python -m pytest -q`. There are 151 tests: 52 app, 6 db (migration file naming, rollback notes), 44 ebay, 6 vision, 43 MySQL integration. Integration tests **skip** when MySQL is down, so "all passed" only covers the DB if 0 were skipped.
 - Fallback warnings (eBay errors, skipped labels, mock pricing) print to the uvicorn console. Check it after every upload.
 
 ## Persistence
 - Local MySQL via Homebrew (`brew services start mysql`), app user `reappraise`; credentials in `.env`
 - `MYSQL_TEST_DATABASE` is truncated before every integration test — never point it at the dev database (`MYSQL_DATABASE`)
 - All SQL lives in `sql/queries.sql` as `-- name:` blocks and is loaded by name. Don't write SQL strings in Python.
-- Schema changes go in a **new** numbered file in `sql/migrations/` (`003_….sql`; a misnamed file makes `init` fail rather than be skipped). Keep one `ALTER TABLE` per file: MySQL auto-commits DDL, so a file that fails halfway can't roll back. `sql/schema.sql` is the baseline; don't edit it or an already-applied migration. `python db.py init` applies pending migrations and records them in `schema_migrations`. The dev database has real data, so back it up before migrating (`mysqldump --no-tablespaces --set-gtid-purged=OFF`; the app user can't use `--single-transaction`).
-- Deleting an item cascades to `listings_sampled` and `price_estimates`. Categories do **not** cascade: an empty category stays until it's deleted by hand.
+- Schema changes go in a **new** numbered file in `sql/migrations/` (`003_….sql`; a misnamed file makes `init` fail rather than be skipped). Keep one `ALTER TABLE` per file: MySQL auto-commits DDL, so a file that fails halfway can't roll back. From 003 on, every migration carries a `-- rollback:` comment; a unit test enforces it, and an integration test runs the notes to rewind the test database to 002 and migrate it forward again. `sql/schema.sql` is the baseline; don't edit it or an already-applied migration. `python db.py init` applies pending migrations and records them in `schema_migrations`. The dev database has real data, so back it up before migrating (`mysqldump --no-tablespaces --set-gtid-purged=OFF`; the app user can't use `--single-transaction`).
+- Deleting an item cascades to `listings_sampled` and `price_estimates`, and from an estimate to its `outcomes` row. Categories do **not** cascade: an empty category stays until it's deleted by hand.
 - Analytics exclude `source = 'mock'` rows and use each item's latest estimate (`ROW_NUMBER()`).
+- Accuracy (`/analytics/accuracy`) compares estimates with `sold_price` only, and always shows n. `final_price` is set after the volunteer has seen the estimate, so it is reported separately as "agreement with volunteer price", never as accuracy.
 
 ## eBay pricing (ebay.py) — decisions to keep
 - **Browse API only → mock fallback.** The Playwright scraper was removed on 2026-09-21: it bypassed eBay's bot detection, which likely breaks eBay's terms of service. It had been added in May when API access was denied, and it's no longer needed. Don't re-add scraping.

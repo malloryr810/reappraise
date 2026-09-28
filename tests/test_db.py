@@ -23,3 +23,29 @@ def test_misnamed_migration_file_is_an_error_not_skipped(migrations_dir, bad_nam
 
     with pytest.raises(ValueError, match=bad_name):
         db.migration_files()
+
+
+def test_rollback_statements_are_read_from_comments(migrations_dir):
+    path = migrations_dir / "003_x.sql"
+    path.write_text(
+        "-- Adds a table.\n"
+        "-- rollback: DROP TABLE IF EXISTS x;\n"
+        "-- rollback: DELETE FROM y WHERE z = 1;\n"
+        "CREATE TABLE x (id INT);\n"
+    )
+
+    assert db.rollback_statements(path) == ["DROP TABLE IF EXISTS x", "DELETE FROM y WHERE z = 1"]
+    assert db._statements(path) == ["CREATE TABLE x (id INT)"]  # the note is never executed
+
+
+# Migrations 001 and 002 predate rollback notes and must not be edited
+_FIRST_MIGRATION_WITH_ROLLBACK = 3
+
+
+def test_every_new_migration_has_a_rollback_note():
+    missing = [
+        version for version, path in db.migration_files()
+        if int(version[:3]) >= _FIRST_MIGRATION_WITH_ROLLBACK and not db.rollback_statements(path)
+    ]
+
+    assert missing == []
