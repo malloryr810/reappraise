@@ -59,18 +59,10 @@ jobs:
         with:
           node-version: "22"
 
+      # PyMySQL[rsa] (see requirements.txt) handles MySQL 8.4's default
+      # caching_sha2_password login on this fresh server
       - name: Install dependencies
         run: pip install -r requirements.txt
-
-      # MySQL 8.4 authenticates with caching_sha2_password. Until a user's
-      # password is cached, a login needs TLS or RSA key exchange, and PyMySQL
-      # can only do RSA with the optional cryptography package. One login with
-      # the runner's mysql client (which uses TLS) fills the cache, after which
-      # PyMySQL's fast path works without it.
-      - name: Prime MySQL's password cache
-        env:
-          MYSQL_PWD: ci-only
-        run: mysql --protocol=TCP -h 127.0.0.1 -P 3306 -u reappraise -e "SELECT VERSION()"
 
       - name: Apply all migrations to the empty test database
         run: |
