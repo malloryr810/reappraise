@@ -7,12 +7,13 @@
 import base64
 import logging
 import os
-import re
 import statistics
 import time
 from dataclasses import dataclass, replace
 
 import httpx
+
+from labels import FALLBACK_TAXONOMY, LabelTaxonomy
 
 
 # Values for PriceEstimate.source — persisted to price_estimates.source.
@@ -40,16 +41,10 @@ _ERROR_BODY_MAX_CHARS = 300
 # search term is tried before settling for it
 _MIN_LISTINGS = 5
 # Each label costs one API call, and lower-confidence labels describe the item
-# less reliably, so broadening stops after the top few usable labels
+# less reliably, so broadening stops after the top few usable labels. Labels
+# the taxonomy skips (materials, colours, catch-alls like "Gadget") and labels
+# merged into an earlier one don't count against it.
 _MAX_LABELS_TO_TRY = 3
-
-# Vision often ranks a catch-all label first ("Gadget" for a game controller).
-# Searched alone, such a term prices the item against every cheap gadget on eBay,
-# so any label containing one of these words is never used as a search query.
-_GENERIC_LABEL_WORDS = frozenset({
-    "gadget", "technology", "product", "object", "item", "equipment", "supplies",
-})
-_WORD = re.compile(r"[a-z]+")
 
 _CACHE_TTL = 2 * 3600  # 2 hours in seconds
 _TOKEN_REFRESH_BUFFER_S = 60
@@ -63,29 +58,37 @@ def _describe_error(exc: Exception) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
-def specific_labels(labels: list[str]) -> list[str]:
-    """Labels specific enough to price an item, in their original (confidence) order."""
-    return [
-        label for label in labels
-        if _GENERIC_LABEL_WORDS.isdisjoint(_WORD.findall(label.lower()))
-    ]
+@dataclass(frozen=True)
+class _SearchTerm:
+    term: str
+    source: str               # SEARCH_SOURCE_USER or SEARCH_SOURCE_VISION
+    vision_label: str | None  # the Vision label behind a vision search
 
 
-def _search_terms(labels: list[str], user_description: str | None) -> list[tuple[str, str]]:
-    """Ordered (term, source) pairs to search: the description, then Vision labels.
+def _search_terms(
+    labels: list[str], user_description: str | None, taxonomy: LabelTaxonomy
+) -> list[_SearchTerm]:
+    """Terms to search in order: the description, then Vision labels.
 
     The description is a person's judgement, so it is searched as given and is
-    never subject to the generic-label filter or the Vision label budget.
+    never subject to the label taxonomy or the Vision label budget.
     """
     description = (user_description or "").strip()
-    terms = [(description, SEARCH_SOURCE_USER)] if description else []
+    terms = [_SearchTerm(description, SEARCH_SOURCE_USER, None)] if description else []
 
-    vision = specific_labels(labels)
-    if not vision and labels:
-        logger.warning("All Vision labels are too generic to search: %r", labels)
-    elif vision and vision[0] != labels[0]:
-        logger.warning("Skipping generic label(s) %r", labels[:labels.index(vision[0])])
-    return terms + [(label, SEARCH_SOURCE_VISION) for label in vision[:_MAX_LABELS_TO_TRY]]
+    searchable, skipped = taxonomy.searchable(labels)
+    if not searchable and labels:
+        logger.warning("All Vision labels are too generic to search: %r",
+                       [(s.label, s.kind) for s in skipped])
+    elif skipped:
+        logger.warning("Skipping non-object label(s) %r", [(s.label, s.kind) for s in skipped])
+    # Each label may cost two queries (itself, then its canonical term) but uses
+    # one slot of the label budget
+    return terms + [
+        _SearchTerm(query, SEARCH_SOURCE_VISION, s.vision_label)
+        for s in searchable[:_MAX_LABELS_TO_TRY]
+        for query in s.queries
+    ]
 
 
 @dataclass(frozen=True)
@@ -111,6 +114,9 @@ class PriceEstimate:
     # The eBay query that produced the listings and where it came from; None for mock
     search_term: str | None = None
     search_source: str | None = None
+    # The Vision label behind a vision_label search; search_term may be its
+    # canonical form ("bicycle" for "Road bicycle"). None otherwise.
+    vision_label: str | None = None
 
 
 _MOCK_CATALOG: dict[str, tuple[float, float, float]] = {
@@ -158,13 +164,17 @@ class EbayClient:
         condition: str = "fair",
         limit: int = 20,
         user_description: str | None = None,
+        taxonomy: LabelTaxonomy = FALLBACK_TAXONOMY,
     ) -> PriceEstimate:
         """Price an item from a volunteer's description and its Vision labels.
 
         Each term is searched on its own — joining them into one query AND's the
         words together and matches almost nothing. A volunteer's description is
-        tried first, then Vision labels ranked most-confident first, skipping
-        generic ones ("gadget"). A term with fewer than _MIN_LISTINGS priced
+        tried first, then Vision labels ranked most-confident first, keeping only
+        the ones `taxonomy` says name an object, one per canonical term. Each is
+        searched as Vision gave it, then as its canonical term if that finds too
+        few listings. The default taxonomy is the built-in generic-word list, used when
+        the database's is unavailable. A term with fewer than _MIN_LISTINGS priced
         listings moves on to the next, and if none reaches it the largest sample
         wins. Mock pricing is used only when there is nothing to search, nothing
         is found, or the API itself fails.
@@ -176,26 +186,28 @@ class EbayClient:
             logger.warning("EBAY_CLIENT_ID / EBAY_CLIENT_SECRET not set — cannot query eBay")
             return self._fallback_to_mock(mock_query, condition)
 
-        terms = _search_terms(labels, user_description)
+        terms = _search_terms(labels, user_description, taxonomy)
         if not terms:
             return self._fallback_to_mock(mock_query, condition)
 
-        best: tuple[tuple[SampledListing, ...], str, str] | None = None
-        for term, source in terms:
+        best: tuple[tuple[SampledListing, ...], _SearchTerm] | None = None
+        for search in terms:
             try:
-                listings = self._search_listings(term, limit)
+                listings = self._search_listings(search.term, limit)
             except Exception as exc:
                 # Auth, rate-limit and network failures won't be fixed by another term
-                logger.warning("eBay Browse API failed for %r — %s", term, _describe_error(exc))
+                logger.warning(
+                    "eBay Browse API failed for %r — %s", search.term, _describe_error(exc)
+                )
                 return self._fallback_to_mock(mock_query, condition)
             if len(listings) >= _MIN_LISTINGS:
-                return self._searched_estimate(listings, term, source, condition, limit)
+                return self._searched_estimate(listings, search, condition, limit)
             logger.warning(
                 "eBay Browse API found %d priced listing(s) for %r (need %d) — trying next term",
-                len(listings), term, _MIN_LISTINGS,
+                len(listings), search.term, _MIN_LISTINGS,
             )
             if listings and (best is None or len(listings) > len(best[0])):
-                best = (listings, term, source)
+                best = (listings, search)
 
         if best is not None:
             return self._searched_estimate(*best, condition, limit)
@@ -263,13 +275,17 @@ class EbayClient:
     def _searched_estimate(
         self,
         listings: tuple[SampledListing, ...],
-        term: str,
-        source: str,
+        search: _SearchTerm,
         condition: str,
         limit: int,
     ) -> PriceEstimate:
         estimate = self._build_estimate(listings, condition, limit)
-        return replace(estimate, search_term=term, search_source=source)
+        return replace(
+            estimate,
+            search_term=search.term,
+            search_source=search.source,
+            vision_label=search.vision_label,
+        )
 
     def _build_estimate(
         self, listings: tuple[SampledListing, ...], condition: str, limit: int

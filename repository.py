@@ -98,6 +98,7 @@ def save_appraisal(
                 "source": estimate.source,
                 "search_term": estimate.search_term,
                 "search_source": estimate.search_source,
+                "vision_label": estimate.vision_label,
             },
         )
         estimate_id = cur.lastrowid
@@ -155,6 +156,7 @@ def recompute_estimate(
                 "source": source,
                 "search_term": original["search_term"],
                 "search_source": original["search_source"],
+                "vision_label": original["vision_label"],
             },
         )
         estimate_id = cur.lastrowid
@@ -166,6 +168,14 @@ def recompute_estimate(
         "sample_size": median_row["sample_size"],
         "source": source,
     }
+
+
+# -- label taxonomy -----------------------------------------------------------
+
+
+def label_taxonomy(conn: Connection) -> list[Row]:
+    """Every row of the labels table; labels.LabelTaxonomy.from_rows builds on it."""
+    return _fetch_all(conn, "label_taxonomy")
 
 
 # -- outcomes -----------------------------------------------------------------

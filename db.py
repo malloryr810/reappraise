@@ -138,6 +138,12 @@ def applied_migrations(conn: Connection) -> set[str]:
         return {row["version"] for row in cur.fetchall()}
 
 
+def pending_migrations(conn: Connection) -> list[str]:
+    """Migration versions not yet applied, oldest first."""
+    done = applied_migrations(conn)
+    return [version for version, _ in migration_files() if version not in done]
+
+
 def init_schema(config: DbConfig) -> list[str]:
     """Create any missing tables, then apply pending migrations in order.
 

@@ -655,8 +655,8 @@
 
 </main>
 
-<script>
-  'use strict';
+<script type="module">
+  import { saveStatus } from './save-status.js';
 
   // ── DOM refs ──────────────────────────────────────────────────
   const btnCamera    = document.getElementById('btn-camera');
@@ -791,14 +791,19 @@
     const mockBadge = est.is_mock === true
       ? ' <span class="badge badge-estimated" title="Price is based on catalog estimates, not live eBay data">Estimated</span>'
       : '';
-    noteEl.innerHTML = `${pct}% of market median · ${condLabel}${mockBadge}`;
+    // badge is a fixed string from save-status.js, never response text
+    const status = saveStatus(data);
+    const unsavedBadge = status.badge
+      ? ` <span class="badge badge-estimated" title="This appraisal wasn't saved, so it won't appear in history">${status.badge}</span>`
+      : '';
+    noteEl.innerHTML = `${pct}% of market median · ${condLabel}${mockBadge}${unsavedBadge}`;
 
     document.getElementById('res-median').textContent    = usd.format(est.market_median);
     document.getElementById('res-condition').textContent  = condLabel;
     document.getElementById('res-range').textContent     = `${usd.format(est.low)} – ${usd.format(est.high)}`;
     document.getElementById('res-sample').textContent    = `${est.sample_size} eBay listing${est.sample_size !== 1 ? 's' : ''}`;
     renderSearch(data);
-    resetOutcome(data.estimate_id);
+    resetOutcome(status.isSaved ? data.estimate_id : null);
 
     show(results);
     results.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -820,8 +825,16 @@
   // Which input set the price. Flags a description that was searched but lost out to a
   // photo label; a mock price already carries its own "estimated" badge.
   function searchNote(row) {
-    const note = SEARCH_SOURCE_LABELS[row.search_source] ?? '';
-    return descriptionFellBack(row) ? 'description had too few matches' : note;
+    if (descriptionFellBack(row)) return 'description had too few matches';
+    if (searchedCanonicalTerm(row)) return `photo label “${row.vision_label}”`;
+    return SEARCH_SOURCE_LABELS[row.search_source] ?? '';
+  }
+
+  // The label taxonomy searches some photo labels under a shared term ("bicycle" for
+  // "Road bicycle"); name the original label so the search term isn't a surprise.
+  function searchedCanonicalTerm(row) {
+    return row.search_source === 'vision_label' && Boolean(row.vision_label)
+      && row.vision_label.trim().toLowerCase() !== (row.search_term ?? '').trim().toLowerCase();
   }
 
   function descriptionFellBack(row) {
@@ -829,7 +842,7 @@
   }
 
   // ── Price actually used ───────────────────────────────────────
-  // Only offered when the appraisal was saved (estimate_id is null when persistence is off).
+  // Only offered when the appraisal was saved (see save-status.js).
   function resetOutcome(estimateId) {
     currentEstimateId = estimateId ?? null;
     inputFinalPrice.value = '';

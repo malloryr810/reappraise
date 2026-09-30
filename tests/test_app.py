@@ -1,3 +1,4 @@
+import logging
 from contextlib import contextmanager
 from dataclasses import replace
 from unittest.mock import MagicMock, patch
@@ -10,6 +11,7 @@ import app as app_module
 from app import app
 from db import DbConfig
 from ebay import PriceEstimate
+from labels import FALLBACK_TAXONOMY
 from repository import RecordedOutcome, SavedAppraisal
 from vision import ItemLabel
 
@@ -128,6 +130,7 @@ def test_condition_param_is_forwarded_to_search():
 
     mock_search.assert_called_once_with(
         ["camera", "electronics"], condition="good", user_description=None,
+        taxonomy=FALLBACK_TAXONOMY,
     )
 
 
@@ -452,7 +455,9 @@ def test_accuracy_report_separates_sold_price_accuracy_from_agreement(monkeypatc
     monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
 
     def row(basis, term, n):
-        return {"basis": basis, "search_term": term, "n": n, "mape_pct": 10.0,
+        source = None if term is None else "vision_label"
+        return {"basis": basis, "search_source": source, "search_term": term, "n": n,
+                "mape_pct": 10.0,
                 "median_ape_pct": 9.0, "median_abs_error": 4.0, "bias": 1.0}
 
     rows = [row("final_price", None, 4), row("final_price", "lamp", 4),
@@ -485,7 +490,8 @@ def test_accuracy_report_without_sales_has_no_overall(monkeypatch):
 
 def _accuracy_rows(*ns_by_term):
     return [
-        {"basis": "sold_price", "search_term": term, "n": n, "mape_pct": 10.0,
+        {"basis": "sold_price", "search_source": None if term is None else "vision_label",
+         "search_term": term, "n": n, "mape_pct": 10.0,
          "median_ape_pct": 9.0, "median_abs_error": 4.0, "bias": 1.0}
         for term, n in ns_by_term
     ]
@@ -534,3 +540,190 @@ def test_invalid_min_n_is_rejected(monkeypatch, min_n):
     monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
 
     assert _get_accuracy([], f"?min_n={min_n}").status_code == 422
+
+
+# -- label taxonomy -------------------------------------------------------------
+
+_LABEL_ROWS = [
+    {"label": "plastic", "canonical_term": None, "kind": "material"},
+    {"label": "road bicycle", "canonical_term": "bicycle", "kind": "object"},
+]
+
+
+def _appraise_with_taxonomy(labels, **taxonomy_patch):
+    with (
+        patch.object(app_module._vision, "identify_item", return_value=labels),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE) as mock_search,
+        patch.object(app_module, "connect", _fake_connect),
+        patch.object(app_module.repository, "label_taxonomy", **taxonomy_patch),
+        patch.object(app_module.repository, "save_appraisal", return_value=_SAVED) as mock_save,
+    ):
+        resp = _post()
+    return resp, mock_search.call_args.kwargs["taxonomy"], mock_save
+
+
+def test_label_taxonomy_is_read_from_the_database(monkeypatch):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    labels = [ItemLabel("Plastic", 0.9), ItemLabel("Road bicycle", 0.8)]
+
+    resp, taxonomy, mock_save = _appraise_with_taxonomy(labels, return_value=_LABEL_ROWS)
+
+    assert resp.status_code == 200
+    assert taxonomy is not FALLBACK_TAXONOMY
+    # The category is the canonical term of the first searchable label
+    assert resp.json()["item"] == "bicycle"
+    assert mock_save.call_args.kwargs["category"] == "bicycle"
+    assert mock_save.call_args.kwargs["description"] == "Plastic Road bicycle"  # Vision's raw labels
+
+
+def test_unreadable_taxonomy_falls_back_with_a_warning(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    lost = pymysql.err.OperationalError(2013, "Lost connection")
+
+    resp, taxonomy, _ = _appraise_with_taxonomy(_LABELS, side_effect=lost)
+
+    assert resp.status_code == 200
+    assert taxonomy is FALLBACK_TAXONOMY
+    assert "Label taxonomy unavailable" in caplog.text
+
+
+def test_empty_taxonomy_table_falls_back_with_a_warning(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+
+    resp, taxonomy, _ = _appraise_with_taxonomy(_LABELS, return_value=[])
+
+    assert taxonomy is FALLBACK_TAXONOMY
+    assert "labels table has no valid rows" in caplog.text
+
+
+_BAD_ROW = {"label": "broken", "canonical_term": None, "kind": "object"}
+
+
+def test_invalid_taxonomy_row_is_skipped_and_the_rest_used(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    labels = [ItemLabel("Plastic", 0.9), ItemLabel("Road bicycle", 0.8)]
+
+    resp, taxonomy, _ = _appraise_with_taxonomy(labels, return_value=[*_LABEL_ROWS, _BAD_ROW])
+
+    assert taxonomy is not FALLBACK_TAXONOMY
+    assert resp.json()["item"] == "bicycle"  # the valid rows still apply
+    assert "Label taxonomy has an invalid row: broken" in caplog.text
+    assert "no valid rows" not in caplog.text
+
+
+def test_taxonomy_with_only_invalid_rows_falls_back(monkeypatch, caplog):
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+
+    _, taxonomy, _ = _appraise_with_taxonomy(_LABELS, return_value=[_BAD_ROW])
+
+    assert taxonomy is FALLBACK_TAXONOMY
+    assert "Label taxonomy has an invalid row: broken" in caplog.text
+    assert "labels table has no valid rows" in caplog.text
+
+
+def test_taxonomy_without_persistence_is_the_fallback():
+    with (
+        patch.object(app_module._vision, "identify_item", return_value=_LABELS),
+        patch.object(app_module._ebay, "search_labels", return_value=_ESTIMATE) as mock_search,
+    ):
+        _post()
+
+    assert mock_search.call_args.kwargs["taxonomy"] is FALLBACK_TAXONOMY
+
+
+def test_response_reports_the_vision_label_behind_the_search():
+    estimate = replace(
+        _ESTIMATE, is_mock=False, source="browse_api", search_term="bicycle",
+        search_source="vision_label", vision_label="Road bicycle",
+    )
+    with (
+        patch.object(app_module._vision, "identify_item", return_value=_LABELS),
+        patch.object(app_module._ebay, "search_labels", return_value=estimate),
+    ):
+        body = _post().json()
+
+    assert (body["search_term"], body["vision_label"]) == ("bicycle", "Road bicycle")
+
+
+# -- startup migration check -----------------------------------------------------
+
+def _start_app(monkeypatch, **pending_patch):
+    """Run the app's startup (lifespan) with pending_migrations patched."""
+    monkeypatch.setattr(app_module, "_db_config", _FAKE_DB)
+    with (
+        patch.object(app_module, "connect", _fake_connect),
+        patch.object(app_module, "pending_migrations", **pending_patch) as mock_pending,
+        TestClient(app_module.app),
+    ):
+        pass
+    return mock_pending
+
+
+def test_pending_migrations_are_logged_as_an_error_at_startup(monkeypatch, caplog):
+    _start_app(monkeypatch, return_value=["004_create_labels", "005_add_estimate_vision_label"])
+
+    [record] = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert "004_create_labels" in record.getMessage()
+    assert "db.py init" in record.getMessage()
+
+
+def test_current_schema_logs_no_error_at_startup(monkeypatch, caplog):
+    mock_pending = _start_app(monkeypatch, return_value=[])
+
+    mock_pending.assert_called_once()
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+def test_unreachable_database_at_startup_is_logged(monkeypatch, caplog):
+    lost = pymysql.err.OperationalError(2003, "Can't connect")
+
+    _start_app(monkeypatch, side_effect=lost)
+
+    assert "Could not check database migrations" in caplog.text
+
+
+def test_startup_check_is_skipped_without_persistence():
+    with patch.object(app_module, "pending_migrations") as mock_pending, TestClient(app_module.app):
+        pass
+
+    mock_pending.assert_not_called()
+
+
+# -- logging -------------------------------------------------------------------
+
+def _configure(monkeypatch, level=None):
+    if level is None:
+        monkeypatch.delenv("LOG_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("LOG_LEVEL", level)
+    with patch.object(app_module.logging, "basicConfig") as basic_config:
+        app_module._configure_logging()
+    return basic_config.call_args.kwargs
+
+
+@pytest.mark.parametrize("env,expected", [
+    (None, logging.INFO),
+    ("debug", logging.DEBUG),
+    (" WARNING ", logging.WARNING),
+])
+def test_log_level_defaults_to_info_and_comes_from_env(monkeypatch, env, expected):
+    assert _configure(monkeypatch, env)["level"] == expected
+
+
+def test_unknown_log_level_falls_back_to_info_with_a_warning(monkeypatch, caplog):
+    assert _configure(monkeypatch, "loud")["level"] == logging.INFO
+    assert "LOG_LEVEL='loud' is not a log level" in caplog.text
+
+
+def test_log_lines_carry_time_level_and_logger_name(monkeypatch):
+    fmt = _configure(monkeypatch)["format"]
+
+    for field in ("%(asctime)s", "%(levelname)s", "%(name)s", "%(message)s"):
+        assert field in fmt
+
+
+def test_http_client_request_lines_are_kept_out_of_info_logs(monkeypatch):
+    _configure(monkeypatch)
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
